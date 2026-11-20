@@ -33,6 +33,7 @@ import argparse
 import datetime
 import logging
 import re
+import sys
 from pathlib import Path
 
 import joblib
@@ -102,7 +103,8 @@ SCALER_BY_ROOT = {
         ],
         "RobustScaler",
     ),
-    **dict.fromkeys(["adx14", "rsi14", "stoch"], "MinMaxScaler"),
+    # bounded 0-100 oscillators (DI+/DI- like ADX: explicit, not left to the skew heuristic)
+    **dict.fromkeys(["adx14", "di_plus14", "di_minus14", "rsi14", "stoch"], "MinMaxScaler"),
     "volume": "Log1p+RobustScaler",
     "timestamp": "Passthrough",
 }
@@ -200,15 +202,26 @@ def transform_with_column_scalers(df: pd.DataFrame, col_scalers: dict) -> pd.Dat
     return out.drop(columns=raw_only)
 
 
-def fit_leak_safe(df: pd.DataFrame, cols: list, cutoff: str = FIT_CUTOFF_DATE) -> dict:
-    """Fit ONLY on rows <= cutoff. No silent fallback on the whole dataset."""
+def fit_mask(index: pd.DatetimeIndex, cutoff: str = FIT_CUTOFF_DATE) -> np.ndarray:
+    """
+    Rows allowed in the fit. A date-only cutoff ("2022-12-31") includes that whole day
+    (the fit window is "<= 2022", 2023+ is the holdout); a cutoff with a time is exact.
+    """
     cut = pd.Timestamp(cutoff)
-    if df.index.tz is not None and cut.tzinfo is None:
-        cut = cut.tz_localize(df.index.tz)
-    df_fit = df[df.index <= cut]
+    whole_day = cut == cut.normalize()
+    if index.tz is not None and cut.tzinfo is None:
+        cut = cut.tz_localize(index.tz)
+    return index < cut + pd.Timedelta(days=1) if whole_day else index <= cut
+
+
+def fit_leak_safe(df: pd.DataFrame, cols: list, cutoff: str = FIT_CUTOFF_DATE) -> dict:
+    """Fit ONLY on rows up to the cutoff (see fit_mask). No silent fallback on the whole dataset."""
+    df_fit = df[fit_mask(df.index, cutoff)]
     if df_fit.empty:
         raise RuntimeError(f"no rows <= cutoff {cutoff}: can't fit without using the future.")
-    logging.info("Fit on <= %s (%d rows), transform on all (%d rows).", cut, len(df_fit), len(df))
+    logging.info(
+        "Fit on <= %s (%d rows), transform on all (%d rows).", cutoff, len(df_fit), len(df)
+    )
     return fit_column_scalers(df_fit, cols)
 
 
@@ -250,11 +263,22 @@ def scale_and_save(
         logging.info("Using saved scalers for %s", asset)
         col_scalers = saved["col_scalers"]
         strategy = "use_saved_if_available"
+        # the meta must describe how the reused scalers were fit, not this run's argument
+        fit_cutoff = saved.get("meta", {}).get("fit_cutoff_date", cutoff)
+        if str(fit_cutoff) != str(cutoff):
+            logging.warning(
+                "Saved scalers for %s were fit with cutoff %s (requested %s): "
+                "use --refit to apply the new cutoff.",
+                asset,
+                fit_cutoff,
+                cutoff,
+            )
     else:
         if not refit:
             logging.info("Saved scalers missing or incomplete for %s -> fit", asset)
         col_scalers = fit_leak_safe(df, cols, cutoff)
         strategy = "fit_then_transform"
+        fit_cutoff = cutoff
 
     df_scaled = transform_with_column_scalers(df, col_scalers)
 
@@ -273,7 +297,7 @@ def scale_and_save(
         "asset": asset,
         "class_name": class_name,
         "strategy": strategy,
-        "fit_cutoff_date": cutoff,
+        "fit_cutoff_date": fit_cutoff,
         "version": VERSION,
     }
     joblib.dump(
@@ -293,6 +317,13 @@ def apply_saved_scalers(scalers_path: Path, input_parquet: Path, output: Path | 
     missing = [c for c in col_scalers if c not in df.columns]
     if missing:
         logging.warning("%d scaler columns missing in the input: %s", len(missing), missing[:10])
+    unscaled = [c for c in feature_columns(df) if c not in col_scalers]
+    if unscaled:
+        logging.warning(
+            "%d numeric columns have no saved scaler and are left UNSCALED: %s",
+            len(unscaled),
+            unscaled[:10],
+        )
     out = output or input_parquet.with_name(input_parquet.stem + "_with_scalers.parquet")
     transform_with_column_scalers(df, col_scalers).to_parquet(out)
     logging.info("Transformed parquet saved: %s", out)
@@ -334,6 +365,7 @@ def main():
         apply_saved_scalers(args.apply, args.input, args.output)
         return
 
+    failed = []
     for group, asset in config.iter_assets(args.group, args.assets):
         path = latest_parquet(args.root / "Raw" / group / asset)
         if path is None:
@@ -351,6 +383,11 @@ def main():
             )
         except Exception as e:
             logging.exception("Error on %s: %s", path, e)
+            failed.append(asset)
+
+    if failed:
+        logging.error("%d assets failed: %s", len(failed), failed)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
