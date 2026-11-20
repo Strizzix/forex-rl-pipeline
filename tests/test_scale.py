@@ -38,13 +38,17 @@ def test_scale_and_save(multi_tf, tmp_path):
 
     # raw copies and raw-only columns
     assert np.allclose(df["close_15min_raw"], multi_tf["close_15min"])
-    assert "spread_mean_15min" not in df and np.allclose(df["spread_mean_15min_raw"], multi_tf["spread_mean_15min"])
+    assert "spread_mean_15min" not in df and np.allclose(
+        df["spread_mean_15min_raw"], multi_tf["spread_mean_15min"]
+    )
     # standard columns centered on the fit window, prices recoverable
     fit = df[df.index <= _cut()]
     assert abs(fit["close_1H"].mean()) < 1e-6
     back = saved["col_scalers"]["close_4H"].inverse_transform(df[["close_4H"]].to_numpy())
     assert np.allclose(back.ravel(), multi_tf["close_4H"])
-    assert saved["cols"] == list(saved["col_scalers"]) and saved["meta"]["fit_cutoff_date"] == CUTOFF
+    assert (
+        saved["cols"] == list(saved["col_scalers"]) and saved["meta"]["fit_cutoff_date"] == CUTOFF
+    )
 
     # second run reuses the saved scalers -> same output, still one parquet
     out2 = scale.scale_and_save(multi_tf, "EURUSD", "Majors", tmp_path, cutoff="2099-01-01")

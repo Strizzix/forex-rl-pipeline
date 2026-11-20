@@ -1,17 +1,23 @@
 """
 Downloader checks on synthetic data (no Dukascopy calls).
 """
+
 import numpy as np
 import pandas as pd
-
-from data_management.downloader import DukascopyMultiTFDownloader, merge_bid_ask, required_warmup_days
 from conftest import synth_1min
+
+from data_management.downloader import (
+    DukascopyMultiTFDownloader,
+    merge_bid_ask,
+    required_warmup_days,
+)
 
 DATA = synth_1min()
 
 
 class FakeDownloader(DukascopyMultiTFDownloader):
     """fetch_weekly_data served from the synthetic data instead of Dukascopy."""
+
     def fetch_weekly_data(self, fetch_start=None):
         if fetch_start is None:
             fetch_start = self.start_date - pd.Timedelta(days=self.warmup_days)
@@ -51,7 +57,7 @@ def test_update_matches_full_build(tmp_path):
 
     a = pd.read_parquet(list((upd / "EURUSD").glob("*.parquet"))[0])
     b = pd.read_parquet(list((full / "EURUSD").glob("*.parquet"))[0])
-    assert len(list((upd / "EURUSD").glob("*.parquet"))) == 1   # old file replaced
+    assert len(list((upd / "EURUSD").glob("*.parquet"))) == 1  # old file replaced
     assert a.index.is_unique and a.index.equals(b.index)
     # EMA/ATR have infinite memory: with the warmup the difference is negligible, not 0.
     # The 1D long EMAs don't fully converge in 314 days of warmup (~220 daily bars),

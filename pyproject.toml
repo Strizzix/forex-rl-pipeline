@@ -1,0 +1,18 @@
+[tool.black]
+line-length = 100
+target-version = ["py39"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP"]
+ignore = ["E501"]  # long lines are handled by black (only strings/comments can exceed)
+
+[tool.ruff.lint.isort]
+known-first-party = ["data_management"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

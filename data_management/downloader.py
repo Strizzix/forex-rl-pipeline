@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 downloader.py — Dukascopy 1min bid/ask -> multi-timeframe parquet with indicators.
 
@@ -20,15 +19,16 @@ Usage:
     python -m data_management.downloader --root D:/Data --mode update
     python -m data_management.downloader --root D:/Data --mode full --group Minors --end 2026-08-26
 """
+
+import argparse
 import os
 import sys
-import argparse
 from datetime import timedelta
 
 import numpy as np
 import pandas as pd
-from ta.trend import EMAIndicator, WMAIndicator, ADXIndicator, CCIIndicator, MACD
 from ta.momentum import RSIIndicator, StochasticOscillator
+from ta.trend import MACD, ADXIndicator, CCIIndicator, EMAIndicator, WMAIndicator
 from ta.volatility import AverageTrueRange, BollingerBands
 
 from . import config
@@ -45,13 +45,19 @@ EMA_CONFIG = {
 }
 
 VOLA_WINDOW = {
-    "1min": 200, "5min": 200, "15min": 200, "30min": 200,
-    "1H": 100, "4H": 50, "1D": 20, "1W": 10,
+    "1min": 200,
+    "5min": 200,
+    "15min": 200,
+    "30min": 200,
+    "1H": 100,
+    "4H": 50,
+    "1D": 20,
+    "1W": 10,
 }
 
 TIMEFRAMES = {"15min": "15min", "30min": "30min", "1H": "1h", "4H": "4h", "1D": "1D"}
 
-HEAD_TRIM = 500   # rows dropped at the start of a full build (warmup noise)
+HEAD_TRIM = 500  # rows dropped at the start of a full build (warmup noise)
 
 # Fixed origin for the intraday bins. Without it pandas anchors the bins to the
 # midnight of the FIRST downloaded day: if that day is in summer time (CEST) the
@@ -76,8 +82,16 @@ def required_warmup_days(safety_margin_days=25):
 
 
 class DukascopyMultiTFDownloader:
-    def __init__(self, start_date, end_date, output_dir, instrument_name="EURUSD",
-                 instrument=None, timezone=config.TIMEZONE, warmup_days="auto"):
+    def __init__(
+        self,
+        start_date,
+        end_date,
+        output_dir,
+        instrument_name="EURUSD",
+        instrument=None,
+        timezone=config.TIMEZONE,
+        warmup_days="auto",
+    ):
         self.start_date = pd.to_datetime(start_date).tz_localize("UTC")
         self.end_date = pd.to_datetime(end_date).tz_localize("UTC")
         self.output_dir = output_dir
@@ -105,11 +119,16 @@ class DukascopyMultiTFDownloader:
 
     def safe_fetch(self, start, end, offer_side, retries=10):
         import dukascopy_python
+
         for i in range(retries):
             try:
-                df = dukascopy_python.fetch(start=start, end=end, instrument=self.instrument,
-                                            offer_side=offer_side,
-                                            interval=dukascopy_python.INTERVAL_MIN_1)
+                df = dukascopy_python.fetch(
+                    start=start,
+                    end=end,
+                    instrument=self.instrument,
+                    offer_side=offer_side,
+                    interval=dukascopy_python.INTERVAL_MIN_1,
+                )
                 if df is not None and not df.empty:
                     return df
             except Exception as e:
@@ -118,7 +137,8 @@ class DukascopyMultiTFDownloader:
 
     def fetch_weekly_data(self, fetch_start=None):
         """1min mid OHLCV + spread from fetch_start (default start_date - warmup) to end_date."""
-        from dukascopy_python import OFFER_SIDE_BID, OFFER_SIDE_ASK
+        from dukascopy_python import OFFER_SIDE_ASK, OFFER_SIDE_BID
+
         if fetch_start is None:
             fetch_start = self.start_date - timedelta(days=self.warmup_days)
 
@@ -137,10 +157,12 @@ class DukascopyMultiTFDownloader:
             return None
 
         df = pd.concat(all_data).sort_index()
-        df = df[~df.index.duplicated(keep="first")]   # window edges
+        df = df[~df.index.duplicated(keep="first")]  # window edges
         n_zero = int((df["volume"] == 0).sum())
-        print(f"[Check] volume=0 bars (market closed) kept: {n_zero:,} / {len(df):,} "
-              f"({n_zero / len(df) * 100:.2f}%)")
+        print(
+            f"[Check] volume=0 bars (market closed) kept: {n_zero:,} / {len(df):,} "
+            f"({n_zero / len(df) * 100:.2f}%)"
+        )
         if df.index.tz is None:
             df.index = df.index.tz_localize("UTC")
         df.index = df.index.tz_convert(self.timezone)
@@ -153,7 +175,7 @@ class DukascopyMultiTFDownloader:
         df = df.dropna(subset=["open", "high", "low", "close"], how="any").copy()
         if df.empty:
             return pd.DataFrame()
-        o, h, l, c, v = df["open"], df["high"], df["low"], df["close"], df["volume"]
+        o, h, lo, c, v = df["open"], df["high"], df["low"], df["close"], df["volume"]
 
         for p in EMA_CONFIG.get(tf, []):
             ema = EMAIndicator(c, window=p).ema_indicator()
@@ -161,22 +183,22 @@ class DukascopyMultiTFDownloader:
             df[f"EMA{p}_slope"] = ema.diff()
             df[f"WMA{p}"] = WMAIndicator(c, window=p).wma()
 
-        adx = ADXIndicator(h, l, c, window=14)
+        adx = ADXIndicator(h, lo, c, window=14)
         df["ADX14"] = adx.adx()
         df["DI_plus14"] = adx.adx_pos()
         df["DI_minus14"] = adx.adx_neg()
         df["RSI14"] = RSIIndicator(c, window=14).rsi()
-        df["CCI20"] = CCIIndicator(h, l, c, window=20).cci()
+        df["CCI20"] = CCIIndicator(h, lo, c, window=20).cci()
         if tf in ("1min", "5min", "15min", "30min"):
-            df["Stoch"] = StochasticOscillator(h, l, c).stoch()
+            df["Stoch"] = StochasticOscillator(h, lo, c).stoch()
         if tf == "1H":
             macd = MACD(c)
             df["MACD"] = macd.macd()
             df["MACD_signal"] = macd.macd_signal()
             df["MACD_diff"] = macd.macd_diff()
 
-        df["ATR14"] = AverageTrueRange(h, l, c, window=14).average_true_range()
-        df["ATR50"] = AverageTrueRange(h, l, c, window=50).average_true_range()
+        df["ATR14"] = AverageTrueRange(h, lo, c, window=14).average_true_range()
+        df["ATR50"] = AverageTrueRange(h, lo, c, window=50).average_true_range()
         df["ATR_norm"] = df["ATR14"] / (c + 1e-12)
         bb = BollingerBands(c, window=20, window_dev=2)
         df["BB_width"] = bb.bollinger_hband() - bb.bollinger_lband()
@@ -188,25 +210,26 @@ class DukascopyMultiTFDownloader:
         df["Volatility_regime"] = vol_roll / (vol_roll.rolling(win, min_periods=win).mean() + 1e-12)
 
         body = c - o
-        df["high_low_range"] = h - l
+        df["high_low_range"] = h - lo
         df["close_open_diff"] = body
         df["log_return"] = np.log(c / c.shift()).fillna(0.0)
         df["abs_return"] = ret.abs()
         df["candle_body"] = body.abs()
-        df["candle_shadow"] = (h - l) - df["candle_body"]
-        df["candle_pressure"] = body / (h - l + 1e-8)
+        df["candle_shadow"] = (h - lo) - df["candle_body"]
+        df["candle_pressure"] = body / (h - lo + 1e-8)
         df["range_ratio"] = df["candle_body"] / (df["high_low_range"] + 1e-8)
-        df["vwp"] = ((c * v).rolling(50, min_periods=50).sum()
-                     / (v.rolling(50, min_periods=50).sum() + 1e-8))
+        df["vwp"] = (c * v).rolling(50, min_periods=50).sum() / (
+            v.rolling(50, min_periods=50).sum() + 1e-8
+        )
         df["momentum_proxy"] = c.diff(3) / (c.shift(3) + 1e-12)
 
         if tf == "1D":
-            pivot = (h + l + c) / 3.0
+            pivot = (h + lo + c) / 3.0
             df["Pivot"] = pivot
-            df["R1"] = 2 * pivot - l
+            df["R1"] = 2 * pivot - lo
             df["S1"] = 2 * pivot - h
-            df["R2"] = pivot + (h - l)
-            df["S2"] = pivot - (h - l)
+            df["R2"] = pivot + (h - lo)
+            df["S2"] = pivot - (h - lo)
         return df
 
     def resample_timeframes(self, df, trim_head=True, cutoff=None):
@@ -218,13 +241,23 @@ class DukascopyMultiTFDownloader:
                     the start of the warmup, so no warmup row gets cut here.
         """
         cutoff = self.start_date if cutoff is None else pd.Timestamp(cutoff)
-        cutoff = cutoff.tz_localize(self.timezone) if cutoff.tzinfo is None else cutoff.tz_convert(self.timezone)
+        cutoff = (
+            cutoff.tz_localize(self.timezone)
+            if cutoff.tzinfo is None
+            else cutoff.tz_convert(self.timezone)
+        )
 
         origin = pd.Timestamp(BIN_ORIGIN, tz=self.timezone)
-        ohlc_15 = df.resample("15min", origin=origin).agg({
-            "open": "first", "high": "max", "low": "min", "close": "last",
-            "volume": "sum", "spread": ["mean", "max"],
-        })
+        ohlc_15 = df.resample("15min", origin=origin).agg(
+            {
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+                "volume": "sum",
+                "spread": ["mean", "max"],
+            }
+        )
         ohlc_15.columns = ["open", "high", "low", "close", "volume", "spread_mean", "spread_max"]
         base = self.add_features(ohlc_15, "15min").add_suffix("_15min")
         parts = [base]
@@ -232,9 +265,10 @@ class DukascopyMultiTFDownloader:
         for tf, rule in TIMEFRAMES.items():
             if tf == "15min":
                 continue
-            kw = {} if tf == "1D" else {"origin": origin}   # 1D is calendar based already
-            ohlc = df.resample(rule, **kw).agg({"open": "first", "high": "max", "low": "min",
-                                                "close": "last", "volume": "sum"})
+            kw = {} if tf == "1D" else {"origin": origin}  # 1D is calendar based already
+            ohlc = df.resample(rule, **kw).agg(
+                {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+            )
             ohlc = ohlc.dropna(subset=["open", "high", "low", "close"], how="any")
             if ohlc.empty:
                 print(f"[Resample] TF {tf}: no closed bars available")
@@ -259,9 +293,11 @@ class DukascopyMultiTFDownloader:
             nan_cols = combined.iloc[:20].isna().sum()
             nan_cols = nan_cols[nan_cols > 0]
             if len(nan_cols):
-                print(f"[Warning] NaN in the first 20 rows after trim ({len(nan_cols)} cols): "
-                      f"{list(nan_cols.index[:8])} ... Dukascopy data probably missing for "
-                      f"part of the warmup ({self.warmup_days} days).")
+                print(
+                    f"[Warning] NaN in the first 20 rows after trim ({len(nan_cols)} cols): "
+                    f"{list(nan_cols.index[:8])} ... Dukascopy data probably missing for "
+                    f"part of the warmup ({self.warmup_days} days)."
+                )
         return combined
 
     # ── save / load ─────────────────────────────────────────────────────────
@@ -269,8 +305,11 @@ class DukascopyMultiTFDownloader:
         """Most recently modified <asset>*.parquet in the asset folder, or None."""
         if not os.path.exists(self.pair_dir):
             return None
-        files = [f for f in os.listdir(self.pair_dir)
-                 if f.startswith(self.instrument_name) and f.endswith(".parquet")]
+        files = [
+            f
+            for f in os.listdir(self.pair_dir)
+            if f.startswith(self.instrument_name) and f.endswith(".parquet")
+        ]
         if not files:
             return None
         files.sort(key=lambda f: os.path.getmtime(os.path.join(self.pair_dir, f)), reverse=True)
@@ -281,7 +320,9 @@ class DukascopyMultiTFDownloader:
         os.makedirs(self.pair_dir, exist_ok=True)
         start = (start or self.start_date).strftime("%Y_%m_%d")
         end = (end or self.end_date).strftime("%Y_%m_%d")
-        path = os.path.join(self.pair_dir, f"{self.instrument_name}_multiTF_{start}_to_{end}.parquet")
+        path = os.path.join(
+            self.pair_dir, f"{self.instrument_name}_multiTF_{start}_to_{end}.parquet"
+        )
         df.to_parquet(path)
         print(f"Saved: {path}")
         if old_path and os.path.abspath(old_path) != os.path.abspath(path):
@@ -310,8 +351,11 @@ class DukascopyMultiTFDownloader:
 
         print(f"[Update] loading {existing_path}")
         df_old = pd.read_parquet(existing_path)
-        df_old.index = (df_old.index.tz_localize(self.timezone) if df_old.index.tz is None
-                        else df_old.index.tz_convert(self.timezone))
+        df_old.index = (
+            df_old.index.tz_localize(self.timezone)
+            if df_old.index.tz is None
+            else df_old.index.tz_convert(self.timezone)
+        )
         last_ts = df_old.index.max()
         if last_ts >= self.end_date.tz_convert(self.timezone):
             print(f"[Update] already up to date ({last_ts}).")
@@ -319,8 +363,10 @@ class DukascopyMultiTFDownloader:
 
         # download warmup + new block, build features on all of it
         fetch_from = last_ts - timedelta(days=self.warmup_days)
-        print(f"[Update] last row {last_ts} -> downloading from {fetch_from.date()} "
-              f"(warmup incl.) to {self.end_date.date()}")
+        print(
+            f"[Update] last row {last_ts} -> downloading from {fetch_from.date()} "
+            f"(warmup incl.) to {self.end_date.date()}"
+        )
         df_1min = self.fetch_weekly_data(fetch_start=fetch_from.tz_convert("UTC"))
         if df_1min is None or df_1min.empty:
             print(f"[Update] no 1min data downloaded for {self.instrument_name}.")
@@ -336,12 +382,16 @@ class DukascopyMultiTFDownloader:
         nan_cols = df_new.iloc[:10].isna().sum()
         nan_cols = nan_cols[nan_cols > 0]
         if len(nan_cols):
-            print(f"[Update Warning] NaN in the first new rows ({len(nan_cols)} cols): "
-                  f"{list(nan_cols.index[:8])} ... try a bigger warmup_days ({self.warmup_days}).")
+            print(
+                f"[Update Warning] NaN in the first new rows ({len(nan_cols)} cols): "
+                f"{list(nan_cols.index[:8])} ... try a bigger warmup_days ({self.warmup_days})."
+            )
 
         common = df_old.columns.intersection(df_new.columns)
-        for label, cols in (("new cols not in the old parquet", df_new.columns.difference(df_old.columns)),
-                            ("old cols missing in the new data", df_old.columns.difference(df_new.columns))):
+        for label, cols in (
+            ("new cols not in the old parquet", df_new.columns.difference(df_old.columns)),
+            ("old cols missing in the new data", df_old.columns.difference(df_new.columns)),
+        ):
             if len(cols):
                 print(f"[Update] {label} ({len(cols)}): {list(cols)[:5]} ...")
 
@@ -359,12 +409,15 @@ def merge_bid_ask(df_bid, df_ask, label=""):
     market closed) is kept, using the other side for that same timestamp only
     (never a forward fill in time: no bar is invented).
     """
-    df = pd.merge(df_bid, df_ask, left_index=True, right_index=True,
-                  suffixes=("_bid", "_ask"), how="outer")
+    df = pd.merge(
+        df_bid, df_ask, left_index=True, right_index=True, suffixes=("_bid", "_ask"), how="outer"
+    )
     n_bid_only, n_ask_only = df["close_ask"].isna().sum(), df["close_bid"].isna().sum()
     if n_bid_only or n_ask_only:
-        print(f"[Merge] {label}: {n_bid_only} bid-only minutes, {n_ask_only} ask-only minutes "
-              f"(filled from the other side, no rows dropped)")
+        print(
+            f"[Merge] {label}: {n_bid_only} bid-only minutes, {n_ask_only} ask-only minutes "
+            f"(filled from the other side, no rows dropped)"
+        )
     for col in ["open", "high", "low", "close", "volume"]:
         df[f"{col}_bid"] = df[f"{col}_bid"].fillna(df[f"{col}_ask"])
         df[f"{col}_ask"] = df[f"{col}_ask"].fillna(df[f"{col}_bid"])
@@ -380,8 +433,15 @@ def merge_bid_ask(df_bid, df_ask, label=""):
 
 
 def main():
-    p = argparse.ArgumentParser(description="Download Dukascopy data and build the multi-TF parquets.")
-    p.add_argument("--root", type=str, default=str(config.DATA_ROOT), help="data root (parquets go in <root>/Raw)")
+    p = argparse.ArgumentParser(
+        description="Download Dukascopy data and build the multi-TF parquets."
+    )
+    p.add_argument(
+        "--root",
+        type=str,
+        default=str(config.DATA_ROOT),
+        help="data root (parquets go in <root>/Raw)",
+    )
     p.add_argument("--mode", choices=["update", "full"], default="update")
     p.add_argument("--group", nargs="*", help="Majors / Minors (default: all)")
     p.add_argument("--assets", nargs="*", help="e.g. EURUSD GBPUSD (default: all)")
@@ -394,10 +454,14 @@ def main():
     for i, (group, name) in enumerate(todo, 1):
         print(f"\n=== [{i}/{len(todo)}] {group}/{name} | MODE={args.mode} ===", flush=True)
         try:
-            dl = DukascopyMultiTFDownloader(args.start, args.end,
-                                            os.path.join(args.root, "Raw", group), name,
-                                            instrument=config.dukascopy_instrument(name),
-                                            timezone=args.tz)
+            dl = DukascopyMultiTFDownloader(
+                args.start,
+                args.end,
+                os.path.join(args.root, "Raw", group),
+                name,
+                instrument=config.dukascopy_instrument(name),
+                timezone=args.tz,
+            )
             dl.update_parquet() if args.mode == "update" else dl.run()
         except Exception as e:
             print(f"Error {name}: {e}", file=sys.stderr)

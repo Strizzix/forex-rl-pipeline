@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 scale.py — per-column scaling of the multi-TF parquets made by downloader.py.
 
@@ -27,29 +26,36 @@ Usage:
     python -m data_management.scale --root D:/Data --diagnose     # only print the scaler per column
     python -m data_management.scale --apply all_scalers.pkl --input new.parquet
 """
+
 from __future__ import annotations
 
-import re
 import argparse
 import datetime
 import logging
+import re
 from pathlib import Path
 
 import joblib
 import numpy as np
 import pandas as pd
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler, FunctionTransformer
+from sklearn.preprocessing import FunctionTransformer, MinMaxScaler, RobustScaler, StandardScaler
 
 from . import config
 
 FIT_CUTOFF_DATE = config.FIT_CUTOFF_DATE
 JOBLIB_COMPRESS = 3
-VERSION = "3.4"   # kept for compatibility with the existing all_scalers.pkl
+VERSION = "3.4"  # kept for compatibility with the existing all_scalers.pkl
 
 # 15min columns also kept as <col>_raw before being overwritten with scaled values
-RAW_COLUMNS_TO_REPLACE = {"open_15min", "high_15min", "low_15min", "close_15min",
-                          "volume_15min", "atr14_15min"}
+RAW_COLUMNS_TO_REPLACE = {
+    "open_15min",
+    "high_15min",
+    "low_15min",
+    "close_15min",
+    "volume_15min",
+    "atr14_15min",
+}
 # never scaled, only kept as <col>_raw (original removed). Substring match.
 RAW_ONLY_TOKENS = {"spread_mean", "spread_max"}
 
@@ -57,12 +63,45 @@ TF_SUFFIX = re.compile(r"_(15min|30min|1h|4h|1d)$")
 
 # scaler by feature root (lowercase, no TF suffix)
 SCALER_BY_ROOT = {
-    **dict.fromkeys(["open", "high", "low", "close", "vwp", "momentum_proxy",
-                     "atr14", "atr50", "atr_norm", "volatility", "log_return", "abs_return",
-                     "macd", "macd_signal", "macd_diff",
-                     "pivot", "r1", "s1", "r2", "s2"], "StandardScaler"),
-    **dict.fromkeys(["cci20", "bb_width", "volatility_regime", "high_low_range", "close_open_diff",
-                     "candle_body", "candle_shadow", "candle_pressure", "range_ratio"], "RobustScaler"),
+    **dict.fromkeys(
+        [
+            "open",
+            "high",
+            "low",
+            "close",
+            "vwp",
+            "momentum_proxy",
+            "atr14",
+            "atr50",
+            "atr_norm",
+            "volatility",
+            "log_return",
+            "abs_return",
+            "macd",
+            "macd_signal",
+            "macd_diff",
+            "pivot",
+            "r1",
+            "s1",
+            "r2",
+            "s2",
+        ],
+        "StandardScaler",
+    ),
+    **dict.fromkeys(
+        [
+            "cci20",
+            "bb_width",
+            "volatility_regime",
+            "high_low_range",
+            "close_open_diff",
+            "candle_body",
+            "candle_shadow",
+            "candle_pressure",
+            "range_ratio",
+        ],
+        "RobustScaler",
+    ),
     **dict.fromkeys(["adx14", "rsi14", "stoch"], "MinMaxScaler"),
     "volume": "Log1p+RobustScaler",
     "timestamp": "Passthrough",
@@ -96,17 +135,26 @@ def make_pipeline(name: str):
     if name == "Passthrough":
         return None
     if name == "Log1p+RobustScaler":
-        return Pipeline([("log1p", FunctionTransformer(np.log1p, validate=False)), ("robust", RobustScaler())])
-    scaler = {"StandardScaler": StandardScaler, "RobustScaler": RobustScaler,
-              "MinMaxScaler": MinMaxScaler}[name]()
+        return Pipeline(
+            [("log1p", FunctionTransformer(np.log1p, validate=False)), ("robust", RobustScaler())]
+        )
+    scaler = {
+        "StandardScaler": StandardScaler,
+        "RobustScaler": RobustScaler,
+        "MinMaxScaler": MinMaxScaler,
+    }[name]()
     return Pipeline([("scaler", scaler)])
 
 
 def feature_columns(df: pd.DataFrame) -> list:
     """Numeric columns to scale (no *_raw, no raw-only)."""
-    return [c for c in df.columns
-            if pd.api.types.is_numeric_dtype(df[c]) and not c.lower().endswith("_raw")
-            and not _is_raw_only(c)]
+    return [
+        c
+        for c in df.columns
+        if pd.api.types.is_numeric_dtype(df[c])
+        and not c.lower().endswith("_raw")
+        and not _is_raw_only(c)
+    ]
 
 
 # ── fit / transform ─────────────────────────────────────────────────────────
@@ -182,8 +230,14 @@ def _ensure_datetime_index(df):
 
 
 # ── per asset ───────────────────────────────────────────────────────────────
-def scale_and_save(df: pd.DataFrame, asset: str, class_name: str, save_root: Path,
-                   refit: bool = False, cutoff: str = FIT_CUTOFF_DATE):
+def scale_and_save(
+    df: pd.DataFrame,
+    asset: str,
+    class_name: str,
+    save_root: Path,
+    refit: bool = False,
+    cutoff: str = FIT_CUTOFF_DATE,
+):
     """Scale one asset and save <asset>_scaled_*.parquet + all_scalers.pkl."""
     df = _ensure_datetime_index(df)
     cols = feature_columns(df)
@@ -214,11 +268,19 @@ def scale_and_save(df: pd.DataFrame, asset: str, class_name: str, save_root: Pat
             old.unlink()
             logging.info("Removed old scaled parquet: %s", old.name)
 
-    meta = {"saved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "asset": asset, "class_name": class_name, "strategy": strategy,
-            "fit_cutoff_date": cutoff, "version": VERSION}
-    joblib.dump({"meta": meta, "col_scalers": col_scalers, "cols": list(col_scalers)},
-                scalers_path, compress=JOBLIB_COMPRESS)
+    meta = {
+        "saved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "asset": asset,
+        "class_name": class_name,
+        "strategy": strategy,
+        "fit_cutoff_date": cutoff,
+        "version": VERSION,
+    }
+    joblib.dump(
+        {"meta": meta, "col_scalers": col_scalers, "cols": list(col_scalers)},
+        scalers_path,
+        compress=JOBLIB_COMPRESS,
+    )
     logging.info("Scalers saved: %s (cols=%d)", scalers_path, len(col_scalers))
     return out_file
 
@@ -244,16 +306,26 @@ def latest_parquet(folder: Path):
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    p = argparse.ArgumentParser(description="Scale the multi-TF parquets (per-column scalers, leak-safe fit).")
-    p.add_argument("--root", type=Path, default=config.DATA_ROOT, help="data root with Raw/ and Scaled/")
+    p = argparse.ArgumentParser(
+        description="Scale the multi-TF parquets (per-column scalers, leak-safe fit)."
+    )
+    p.add_argument(
+        "--root", type=Path, default=config.DATA_ROOT, help="data root with Raw/ and Scaled/"
+    )
     p.add_argument("--group", nargs="*")
     p.add_argument("--assets", nargs="*")
-    p.add_argument("--refit", action="store_true", help="ignore saved scalers and refit on <= cutoff")
+    p.add_argument(
+        "--refit", action="store_true", help="ignore saved scalers and refit on <= cutoff"
+    )
     p.add_argument("--cutoff", default=FIT_CUTOFF_DATE)
-    p.add_argument("--diagnose", action="store_true", help="only print the scaler chosen for each column")
+    p.add_argument(
+        "--diagnose", action="store_true", help="only print the scaler chosen for each column"
+    )
     p.add_argument("--apply", type=Path, help="all_scalers.pkl to apply to --input")
     p.add_argument("--input", type=Path, help="parquet to transform with --apply")
-    p.add_argument("--output", type=Path, help="output of --apply (default <input>_with_scalers.parquet)")
+    p.add_argument(
+        "--output", type=Path, help="output of --apply (default <input>_with_scalers.parquet)"
+    )
     args = p.parse_args()
 
     if args.apply:
@@ -274,7 +346,9 @@ def main():
                 for c in df.columns:
                     logging.info("%-28s -> %s", c, scaler_name(c, df[c]))
                 continue
-            scale_and_save(df, asset, group, args.root / "Scaled", refit=args.refit, cutoff=args.cutoff)
+            scale_and_save(
+                df, asset, group, args.root / "Scaled", refit=args.refit, cutoff=args.cutoff
+            )
         except Exception as e:
             logging.exception("Error on %s: %s", path, e)
 
