@@ -1,13 +1,15 @@
 """
 scale.py — per-column scaling of the multi-TF parquets made by downloader.py.
 
-Every column gets its own sklearn transformer, chosen from the feature name
-(the TF suffix doesn't matter):
+Every column gets its own sklearn transformer. Which one is declared next to the
+indicator that produces the column (indicators.py), so adding or removing an
+indicator needs no change here. Defaults:
   - StandardScaler     : prices (OHLC, EMA, WMA, VWP, pivots), ATR, returns, MACD
   - RobustScaler       : slopes, CCI, BB width, candle shapes, volatility regime
-  - MinMaxScaler       : RSI, ADX, Stoch
+  - MinMaxScaler       : RSI, ADX, DI+/DI-, Stoch
   - log1p + Robust     : volume
   - not scaled         : spread_mean / spread_max -> only kept as <col>_raw
+A column no indicator declares gets a skewness-based fallback and a warning.
 
 Raw copies: open/high/low/close/volume/ATR14 at 15min are also kept as <col>_raw
 (real prices needed downstream for returns and targets). Higher-TF prices can be
@@ -15,7 +17,9 @@ recovered with inverse_transform from the saved scalers.
 
 LEAK-SAFE: scalers are fit ONLY on rows <= FIT_CUTOFF_DATE (2023+ holdout never
 seen). If saved scalers cover all the columns they are reused as they are
-(no refit), so new data goes through exactly the same transform.
+(no refit), so new data goes through exactly the same transform. Scalers fit on
+an older data schema (open-labelled rows) are never reused, and raw files from
+the older downloader are refused until rebuilt.
 
 Saved as <root>/Scaled/<group>/<asset>/all_scalers.pkl (joblib):
     {"meta": {...}, "col_scalers": {col: fitted transformer}, "cols": [...]}
@@ -32,7 +36,6 @@ from __future__ import annotations
 import argparse
 import datetime
 import logging
-import re
 import sys
 from pathlib import Path
 
@@ -42,11 +45,13 @@ import pandas as pd
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import FunctionTransformer, MinMaxScaler, RobustScaler, StandardScaler
 
-from . import config
+from . import config, indicators, storage
 
 FIT_CUTOFF_DATE = config.FIT_CUTOFF_DATE
 JOBLIB_COMPRESS = 3
 VERSION = "3.4"  # kept for compatibility with the existing all_scalers.pkl
+# saved scalers fit on data of another schema (e.g. open-labelled rows) are never reused
+SCHEMA_VERSION = storage.SCHEMA_VERSION
 
 # 15min columns also kept as <col>_raw before being overwritten with scaled values
 RAW_COLUMNS_TO_REPLACE = {
@@ -60,77 +65,36 @@ RAW_COLUMNS_TO_REPLACE = {
 # never scaled, only kept as <col>_raw (original removed). Substring match.
 RAW_ONLY_TOKENS = {"spread_mean", "spread_max"}
 
-TF_SUFFIX = re.compile(r"_(15min|30min|1h|4h|1d)$")
-
-# scaler by feature root (lowercase, no TF suffix)
-SCALER_BY_ROOT = {
-    **dict.fromkeys(
-        [
-            "open",
-            "high",
-            "low",
-            "close",
-            "vwp",
-            "momentum_proxy",
-            "atr14",
-            "atr50",
-            "atr_norm",
-            "volatility",
-            "log_return",
-            "abs_return",
-            "macd",
-            "macd_signal",
-            "macd_diff",
-            "pivot",
-            "r1",
-            "s1",
-            "r2",
-            "s2",
-        ],
-        "StandardScaler",
-    ),
-    **dict.fromkeys(
-        [
-            "cci20",
-            "bb_width",
-            "volatility_regime",
-            "high_low_range",
-            "close_open_diff",
-            "candle_body",
-            "candle_shadow",
-            "candle_pressure",
-            "range_ratio",
-        ],
-        "RobustScaler",
-    ),
-    # bounded 0-100 oscillators (DI+/DI- like ADX: explicit, not left to the skew heuristic)
-    **dict.fromkeys(["adx14", "di_plus14", "di_minus14", "rsi14", "stoch"], "MinMaxScaler"),
-    "volume": "Log1p+RobustScaler",
-    "timestamp": "Passthrough",
-}
-
 
 def _is_raw_only(col):
     return any(tok in col.lower() for tok in RAW_ONLY_TOKENS)
 
 
 def scaler_name(col: str, series: pd.Series | None = None) -> str:
-    """Scaler for a column: by root name, EMA/WMA by pattern, otherwise by skewness."""
+    """
+    Scaler for a column: the one declared by the indicator that produces it (or by the
+    base price/volume columns, see indicators.py). A column no registered indicator
+    produces falls back to a skewness heuristic, with a warning.
+    """
     if _is_raw_only(col):
         return "Passthrough"
-    root = TF_SUFFIX.sub("", col.lower())
-    if root in SCALER_BY_ROOT:
-        return SCALER_BY_ROOT[root]
-    if re.fullmatch(r"(ema|wma)\d+", root):
-        return "StandardScaler"
-    if re.fullmatch(r"ema\d+_slope", root):
-        return "RobustScaler"
-    # unknown column (e.g. DI+/DI-): robust if skewed, standard otherwise
+    name, _ = indicators.scaler_for(col)
+    if name is not None:
+        return name
+    if col.lower() == "timestamp":
+        return "Passthrough"
     try:
         skew = float(series.dropna().skew()) if series is not None else 0.0
     except Exception:
         skew = 0.0
-    return "RobustScaler" if abs(skew) > 1.0 else "StandardScaler"
+    fallback = "RobustScaler" if abs(skew) > 1.0 else "StandardScaler"
+    logging.warning(
+        "Column %s is not produced by any registered indicator: %s chosen by skewness "
+        "(declare its scaler in indicators.py).",
+        col,
+        fallback,
+    )
+    return fallback
 
 
 def make_pipeline(name: str):
@@ -250,8 +214,13 @@ def scale_and_save(
     save_root: Path,
     refit: bool = False,
     cutoff: str = FIT_CUTOFF_DATE,
+    source_meta: dict | None = None,
 ):
-    """Scale one asset and save <asset>_scaled_*.parquet + all_scalers.pkl."""
+    """
+    Scale one asset and save <asset>_scaled_*.parquet + all_scalers.pkl.
+    source_meta (the raw file's metadata: indicators, timestamp convention) is
+    carried over to the scaled parquet.
+    """
     df = _ensure_datetime_index(df)
     cols = feature_columns(df)
     save_path = Path(save_root) / class_name / asset
@@ -259,6 +228,14 @@ def scale_and_save(
     scalers_path = save_path / "all_scalers.pkl"
 
     saved = None if refit else load_scalers(scalers_path)
+    if saved and saved.get("meta", {}).get("schema") != SCHEMA_VERSION:
+        logging.warning(
+            "Saved scalers for %s were fit on schema %s data (current %s) -> refit.",
+            asset,
+            saved.get("meta", {}).get("schema", "1"),
+            SCHEMA_VERSION,
+        )
+        saved = None
     if saved and set(cols).issubset(saved.get("cols", [])):
         logging.info("Using saved scalers for %s", asset)
         col_scalers = saved["col_scalers"]
@@ -284,7 +261,11 @@ def scale_and_save(
 
     name = f"{asset}_scaled_{df.index[0]:%Y_%m_%d}_to_{df.index[-1]:%Y_%m_%d}.parquet"
     out_file = save_path / name
-    df_scaled.to_parquet(out_file)
+    storage.write_parquet(
+        df_scaled,
+        out_file,
+        {**(source_meta or {}), "kind": "scaled", "fit_cutoff_date": fit_cutoff},
+    )
     logging.info("Scaled parquet saved: %s", out_file)
     # one scaled parquet per asset: old ones would break glob("*.parquet") downstream
     for old in save_path.glob(f"{asset}_scaled_*.parquet"):
@@ -299,6 +280,7 @@ def scale_and_save(
         "strategy": strategy,
         "fit_cutoff_date": fit_cutoff,
         "version": VERSION,
+        "schema": SCHEMA_VERSION,
     }
     joblib.dump(
         {"meta": meta, "col_scalers": col_scalers, "cols": list(col_scalers)},
@@ -312,6 +294,15 @@ def scale_and_save(
 def apply_saved_scalers(scalers_path: Path, input_parquet: Path, output: Path | None = None):
     """Transform a new parquet with saved scalers (no fit)."""
     saved = joblib.load(scalers_path)
+    meta = storage.read_meta(input_parquet)
+    saved_schema = saved.get("meta", {}).get("schema")
+    if meta.get("schema") != saved_schema:
+        logging.warning(
+            "Input schema %s differs from the scalers' schema %s: the timestamp convention "
+            "may not match.",
+            meta.get("schema", "1"),
+            saved_schema or "1",
+        )
     df = _ensure_datetime_index(pd.read_parquet(input_parquet))
     col_scalers = {c: s for c, s in saved["col_scalers"].items() if not _is_raw_only(c)}
     missing = [c for c in col_scalers if c not in df.columns]
@@ -325,13 +316,16 @@ def apply_saved_scalers(scalers_path: Path, input_parquet: Path, output: Path | 
             unscaled[:10],
         )
     out = output or input_parquet.with_name(input_parquet.stem + "_with_scalers.parquet")
-    transform_with_column_scalers(df, col_scalers).to_parquet(out)
+    storage.write_parquet(
+        transform_with_column_scalers(df, col_scalers), out, {**meta, "kind": "scaled"}
+    )
     logging.info("Transformed parquet saved: %s", out)
     return out
 
 
 def latest_parquet(folder: Path):
-    files = sorted(folder.glob("*.parquet"), key=lambda p: p.stat().st_mtime)
+    """The features file of an asset (never the bars cache that sits next to it)."""
+    files = sorted(folder.glob("*_multiTF_*.parquet"), key=lambda p: p.stat().st_mtime)
     return files[-1] if files else None
 
 
@@ -373,13 +367,28 @@ def main():
             continue
         logging.info("Processing %s", path.name)
         try:
+            meta = storage.read_meta(path)
+            if meta.get("schema") != SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"{path.name} was built by an older downloader (open-labelled rows): "
+                    f"rebuild it with `downloader --mode full` before scaling."
+                )
             df = pd.read_parquet(path)
             if args.diagnose:
                 for c in df.columns:
-                    logging.info("%-28s -> %s", c, scaler_name(c, df[c]))
+                    _, source = indicators.scaler_for(c)
+                    logging.info(
+                        "%-28s -> %-20s (%s)", c, scaler_name(c, df[c]), source or "fallback"
+                    )
                 continue
             scale_and_save(
-                df, asset, group, args.root / "Scaled", refit=args.refit, cutoff=args.cutoff
+                df,
+                asset,
+                group,
+                args.root / "Scaled",
+                refit=args.refit,
+                cutoff=args.cutoff,
+                source_meta=meta,
             )
         except Exception as e:
             logging.exception("Error on %s: %s", path, e)

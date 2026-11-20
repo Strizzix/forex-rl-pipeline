@@ -34,8 +34,14 @@ def df_1min():
 
 
 @pytest.fixture(scope="session")
-def multi_tf(df_1min):
-    from data_management.downloader import DukascopyMultiTFDownloader
+def bars15(df_1min):
+    from data_management.downloader import make_bars
 
-    dl = DukascopyMultiTFDownloader("2021-12-01", "2022-04-01", "unused", "EURUSD")
-    return dl.resample_timeframes(df_1min)
+    return make_bars(df_1min)
+
+
+@pytest.fixture(scope="session")
+def multi_tf(bars15):
+    from data_management.downloader import build_features
+
+    return build_features(bars15, start="2021-12-01")

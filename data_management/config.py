@@ -3,7 +3,8 @@ config.py — settings shared by downloader.py and scale.py.
 
 Data layout (root = --root or the FX_DATA_ROOT env var, default ./data):
 
-    <root>/Raw/<Majors|Minors>/<ASSET>/<ASSET>_multiTF_<start>_to_<end>.parquet
+    <root>/Raw/<Majors|Minors>/<ASSET>/<ASSET>_bars15min_<start>_to_<end>.parquet   15min bars cache
+    <root>/Raw/<Majors|Minors>/<ASSET>/<ASSET>_multiTF_<start>_to_<end>.parquet     features
     <root>/Scaled/<Majors|Minors>/<ASSET>/<ASSET>_scaled_<start>_to_<end>.parquet
     <root>/Scaled/<Majors|Minors>/<ASSET>/all_scalers.pkl
 """
@@ -21,6 +22,27 @@ DATA_ROOT = Path(os.environ.get("FX_DATA_ROOT", "data"))
 START_DATE = "2013-01-01"
 TIMEZONE = "Europe/Rome"
 FIT_CUTOFF_DATE = "2022-12-31"  # scalers fit on <= 2022, the 2023+ holdout is never seen
+
+# Indicators that go into the dataset (see data_management/indicators.py for the list
+# and what each one computes). Remove a name to leave it out; `--indicators` on the
+# downloader command line overrides this. Changing the list does not need a new
+# download: `downloader --mode features` rebuilds the features from the bars cache.
+INDICATORS = [
+    "ema",
+    "wma",
+    "adx",
+    "rsi",
+    "cci",
+    "stoch",
+    "macd",
+    "atr",  # ATR14_15min is also kept unscaled by scale.py (needed downstream)
+    "bollinger",
+    "volatility",
+    "returns",
+    "candles",
+    "vwp",
+    "pivots",
+]
 
 
 def iter_assets(groups=None, assets=None):

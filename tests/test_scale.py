@@ -1,8 +1,12 @@
+import sys
+
 import joblib
 import numpy as np
 import pandas as pd
+import pytest
 
-from data_management import scale
+from data_management import indicators, scale, storage
+from data_management.downloader import build_features
 
 CUTOFF = "2022-02-15"
 
@@ -77,3 +81,55 @@ def test_apply_warns_on_unscaled_columns(multi_tf, tmp_path, caplog):
     with caplog.at_level("WARNING"):
         scale.apply_saved_scalers(tmp_path / "Majors" / "EURUSD" / "all_scalers.pkl", src)
     assert "new_feature_15min" in caplog.text and "UNSCALED" in caplog.text
+
+
+def test_every_column_has_a_declared_scaler(multi_tf):
+    undeclared = [c for c in multi_tf.columns if indicators.scaler_for(c)[0] is None]
+    assert undeclared == []
+
+
+def test_unknown_column_falls_back_with_warning(caplog):
+    s = pd.Series(np.random.default_rng(0).lognormal(size=500))
+    with caplog.at_level("WARNING"):
+        assert scale.scaler_name("my_new_feature_1H", s) == "RobustScaler"
+    assert "not produced by any registered indicator" in caplog.text
+
+
+def test_indicator_subset_is_scaled(bars15, tmp_path):
+    df = build_features(bars15, start="2021-12-01", names=["rsi", "atr"])
+    out = scale.scale_and_save(df, "EURUSD", "Majors", tmp_path, refit=True, cutoff=CUTOFF)
+    saved = joblib.load(tmp_path / "Majors" / "EURUSD" / "all_scalers.pkl")
+    assert set(saved["cols"]) == set(scale.feature_columns(df))
+    assert "RSI14_4H" in saved["cols"] and "EMA20_1H" not in pd.read_parquet(out)
+
+
+def test_scalers_of_an_older_schema_are_refit(multi_tf, tmp_path, caplog):
+    scale.scale_and_save(multi_tf, "EURUSD", "Majors", tmp_path, refit=True, cutoff=CUTOFF)
+    pkl = tmp_path / "Majors" / "EURUSD" / "all_scalers.pkl"
+    saved = joblib.load(pkl)
+    del saved["meta"]["schema"]  # as written by the old version
+    joblib.dump(saved, pkl)
+    with caplog.at_level("WARNING"):
+        scale.scale_and_save(multi_tf, "EURUSD", "Majors", tmp_path, cutoff=CUTOFF)
+    assert "refit" in caplog.text
+    assert joblib.load(pkl)["meta"]["schema"] == storage.SCHEMA_VERSION
+
+
+def test_main_reads_features_not_bars_and_refuses_old_files(bars15, tmp_path, monkeypatch):
+    pair = tmp_path / "Raw" / "Majors" / "EURUSD"
+    pair.mkdir(parents=True)
+    feats = build_features(bars15, start="2021-12-01", names=["rsi"])
+    storage.write_parquet(bars15, pair / "EURUSD_bars15min_a_to_b.parquet", {"label": "close"})
+    storage.write_parquet(feats, pair / "EURUSD_multiTF_a_to_b.parquet", {"label": "close"})
+    assert scale.latest_parquet(pair).name == "EURUSD_multiTF_a_to_b.parquet"
+
+    monkeypatch.setattr(
+        sys, "argv", ["scale", "--root", str(tmp_path), "--assets", "EURUSD", "--cutoff", CUTOFF]
+    )
+    scale.main()
+    scaled = next((tmp_path / "Scaled" / "Majors" / "EURUSD").glob("*_scaled_*.parquet"))
+    assert storage.read_meta(scaled)["label"] == "close"
+
+    feats.to_parquet(pair / "EURUSD_multiTF_a_to_b.parquet")  # no metadata = old downloader
+    with pytest.raises(SystemExit):
+        scale.main()
