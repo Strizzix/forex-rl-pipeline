@@ -123,7 +123,7 @@ def analyze_gaps(idx: pd.DatetimeIndex) -> dict:
     if gaps.empty:
         return {"weekend": 0, "holiday": 0, "short": 0, "anomalies": gaps}
 
-    weekday = pd.DatetimeIndex(gaps["start"]).dayofweek  # local time
+    weekday = pd.DatetimeIndex(gaps["start"]).day_of_week  # local time
     weekend = weekday.isin([4, 5]) & gaps["hours"].between(*WEEKEND_HOURS)
     short = gaps["hours"] < HOLIDAY_HOURS[0]
     holiday = ~weekend & ~short & gaps["hours"].between(*HOLIDAY_HOURS)

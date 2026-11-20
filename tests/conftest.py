@@ -7,7 +7,7 @@ def synth_1min(start="2021-01-01", days=450, seed=0, tz="Europe/Rome"):
     """Random-walk 1min mid OHLCV + spread (same format as fetch_weekly_data), weekends closed."""
     rng = np.random.default_rng(seed)
     idx = pd.date_range(start, periods=days * 1440, freq="1min", tz="UTC")
-    idx = idx[idx.dayofweek < 5]
+    idx = idx[idx.day_of_week < 5]
     n = len(idx)
     o = 1.1 * np.exp(np.cumsum(rng.normal(0, 1e-4, n)))
     c = o * np.exp(rng.normal(0, 5e-5, n))

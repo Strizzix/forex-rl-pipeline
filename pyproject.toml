@@ -16,3 +16,5 @@ known-first-party = ["data_management"]
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+# deprecated pandas/numpy calls in our own code fail the tests (e.g. pandas 4 removals)
+filterwarnings = ["error::DeprecationWarning:data_management.*"]

@@ -79,7 +79,7 @@ def test_detects_tampered_raw_copy(dataset):
 
 def test_gap_classification():
     idx = pd.date_range("2022-01-03", "2022-01-21 22:00", freq="15min", tz="Europe/Rome")
-    idx = idx[idx.dayofweek < 5]  # weekends closed
+    idx = idx[idx.day_of_week < 5]  # weekends closed
     hole = (idx >= "2022-01-12 03:00") & (idx < "2022-01-12 05:00")  # 2h illiquid gap
     g = checks.analyze_gaps(idx[~hole])
     assert g["weekend"] == 2 and g["short"] == 1 and len(g["anomalies"]) == 0

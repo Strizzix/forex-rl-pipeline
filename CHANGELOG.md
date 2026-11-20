@@ -48,6 +48,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The feature schema no longer depends on the data: all-NaN columns are kept instead of dropped.
   **(AI-assisted)**
 
+### Fixed
+- `checks`: `DatetimeIndex.dayofweek` (deprecated, removed in pandas 4) replaced with
+  `day_of_week`; deprecation warnings raised by the package now fail the test suite. **(AI-assisted)**
+
 ### Suggested, not applied
 - **License**: the repository has no `LICENSE` file; without one, nobody else may legally reuse the
   code. **(AI-assisted review)**
