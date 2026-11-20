@@ -23,6 +23,7 @@ Usage:
 import argparse
 import os
 import sys
+import time
 from datetime import timedelta
 
 import numpy as np
@@ -117,7 +118,7 @@ class DukascopyMultiTFDownloader:
             yield cur, end
             cur = end + timedelta(minutes=1)
 
-    def safe_fetch(self, start, end, offer_side, retries=10):
+    def safe_fetch(self, start, end, offer_side, retries=10, backoff_s=1.0):
         import dukascopy_python
 
         for i in range(retries):
@@ -133,6 +134,9 @@ class DukascopyMultiTFDownloader:
                     return df
             except Exception as e:
                 print(f"Fetch error ({i+1}/{retries}): {e}")
+            # back off before retrying (linear), instead of hammering the server
+            if i < retries - 1:
+                time.sleep(backoff_s * (i + 1))
         return None
 
     def fetch_weekly_data(self, fetch_start=None):
@@ -315,19 +319,23 @@ class DukascopyMultiTFDownloader:
         files.sort(key=lambda f: os.path.getmtime(os.path.join(self.pair_dir, f)), reverse=True)
         return os.path.join(self.pair_dir, files[0])
 
-    def save_parquet(self, df, start=None, end=None, old_path=None):
-        """Save as <asset>_multiTF_<start>_to_<end>.parquet (and remove old_path if renamed)."""
+    def save_parquet(self, df):
+        """
+        Save as <asset>_multiTF_<first row>_to_<last row>.parquet and remove any other
+        <asset>_multiTF_*.parquet in the folder, so there is always one file per asset.
+        """
         os.makedirs(self.pair_dir, exist_ok=True)
-        start = (start or self.start_date).strftime("%Y_%m_%d")
-        end = (end or self.end_date).strftime("%Y_%m_%d")
-        path = os.path.join(
-            self.pair_dir, f"{self.instrument_name}_multiTF_{start}_to_{end}.parquet"
-        )
+        start = df.index.min().strftime("%Y_%m_%d")
+        end = df.index.max().strftime("%Y_%m_%d")
+        prefix = f"{self.instrument_name}_multiTF_"
+        path = os.path.join(self.pair_dir, f"{prefix}{start}_to_{end}.parquet")
         df.to_parquet(path)
         print(f"Saved: {path}")
-        if old_path and os.path.abspath(old_path) != os.path.abspath(path):
-            os.remove(old_path)
-            print(f"Removed old file: {os.path.basename(old_path)}")
+        for f in os.listdir(self.pair_dir):
+            old = os.path.join(self.pair_dir, f)
+            if f.startswith(prefix) and f.endswith(".parquet") and old != path:
+                os.remove(old)
+                print(f"Removed old file: {f}")
         return path
 
     # ── modes ───────────────────────────────────────────────────────────────
@@ -397,7 +405,7 @@ class DukascopyMultiTFDownloader:
 
         df_all = pd.concat([df_old[common], df_new[common]])
         df_all = df_all[~df_all.index.duplicated(keep="last")].sort_index()
-        self.save_parquet(df_all, df_all.index.min(), df_all.index.max(), old_path=existing_path)
+        self.save_parquet(df_all)
         print(f"[Update] {self.instrument_name}: {len(df_old):,} -> {len(df_all):,} rows")
 
 
@@ -418,7 +426,10 @@ def merge_bid_ask(df_bid, df_ask, label=""):
             f"[Merge] {label}: {n_bid_only} bid-only minutes, {n_ask_only} ask-only minutes "
             f"(filled from the other side, no rows dropped)"
         )
-    for col in ["open", "high", "low", "close", "volume"]:
+    # volume: a missing side contributes 0 (filling it from the other side would
+    # double-count the volume of one-sided minutes)
+    df["volume"] = df["volume_bid"].fillna(0.0) + df["volume_ask"].fillna(0.0)
+    for col in ["open", "high", "low", "close"]:
         df[f"{col}_bid"] = df[f"{col}_bid"].fillna(df[f"{col}_ask"])
         df[f"{col}_ask"] = df[f"{col}_ask"].fillna(df[f"{col}_bid"])
 
@@ -426,7 +437,6 @@ def merge_bid_ask(df_bid, df_ask, label=""):
     df["open"] = (df["open_bid"] + df["open_ask"]) / 2
     df["high"] = df[["high_bid", "high_ask"]].max(axis=1)
     df["low"] = df[["low_bid", "low_ask"]].min(axis=1)
-    df["volume"] = df["volume_bid"] + df["volume_ask"]
     # one side missing -> real spread unknown: 0.0 (closed book), row kept
     df["spread"] = (df["close_ask"] - df["close_bid"]).fillna(0.0)
     return df[["open", "high", "low", "close", "volume", "spread"]]
@@ -451,6 +461,7 @@ def main():
     args = p.parse_args()
 
     todo = list(config.iter_assets(args.group, args.assets))
+    failed = []
     for i, (group, name) in enumerate(todo, 1):
         print(f"\n=== [{i}/{len(todo)}] {group}/{name} | MODE={args.mode} ===", flush=True)
         try:
@@ -465,6 +476,11 @@ def main():
             dl.update_parquet() if args.mode == "update" else dl.run()
         except Exception as e:
             print(f"Error {name}: {e}", file=sys.stderr)
+            failed.append(name)
+
+    if failed:
+        print(f"\n{len(failed)}/{len(todo)} assets failed: {failed}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

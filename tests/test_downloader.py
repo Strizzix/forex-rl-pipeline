@@ -2,6 +2,8 @@
 Downloader checks on synthetic data (no Dukascopy calls).
 """
 
+import os
+
 import numpy as np
 import pandas as pd
 from conftest import synth_1min
@@ -91,3 +93,39 @@ def test_merge_bid_ask_keeps_one_sided_minutes():
     assert len(out) == 100
     assert (out.loc[idx[:10], "spread"] == 0).all() and (out.loc[idx[-5:], "spread"] == 0).all()
     assert np.allclose(out.loc[idx[10:-5], "spread"], 0.0002)
+    # one-sided minutes count only the volume of the side that exists (no double count)
+    assert np.allclose(out.loc[idx[:10], "volume"], ask["volume"].iloc[0])
+    assert np.allclose(out.loc[idx[-5:], "volume"], bid["volume"].iloc[0])
+    assert np.allclose(out.loc[idx[10:-5], "volume"], bid["volume"].iloc[0] + ask["volume"].iloc[0])
+
+
+def test_full_build_keeps_one_file_named_after_the_data(tmp_path):
+    pair = tmp_path / "EURUSD"
+    pair.mkdir()
+    (pair / "EURUSD_multiTF_2013_01_01_to_2020_01_01.parquet").write_bytes(b"stale")
+    path = FakeDownloader("2022-01-01", "2022-02-15", str(tmp_path), "EURUSD").run()
+    df = pd.read_parquet(path)
+    assert [p.name for p in pair.glob("*.parquet")] == [os.path.basename(path)]
+    assert os.path.basename(path) == (
+        f"EURUSD_multiTF_{df.index.min():%Y_%m_%d}_to_{df.index.max():%Y_%m_%d}.parquet"
+    )
+
+
+def test_safe_fetch_backs_off_between_retries(monkeypatch):
+    import dukascopy_python
+
+    import data_management.downloader as dlmod
+
+    calls, sleeps = [], []
+
+    def flaky_fetch(**kw):
+        calls.append(kw)
+        if len(calls) < 3:
+            raise ConnectionError("boom")
+        return pd.DataFrame({"close": [1.0]})
+
+    monkeypatch.setattr(dukascopy_python, "fetch", flaky_fetch)
+    monkeypatch.setattr(dlmod.time, "sleep", sleeps.append)
+    dl = DukascopyMultiTFDownloader("2022-01-01", "2022-02-01", "unused", "EURUSD", warmup_days=0)
+    assert dl.safe_fetch(None, None, None, retries=5, backoff_s=2.0) is not None
+    assert len(calls) == 3 and sleeps == [2.0, 4.0]
