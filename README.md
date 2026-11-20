@@ -169,7 +169,9 @@ A table at the end compares the assets and flags outliers in the share of zero-v
 
 `compare_versions` checks that the new 15min columns equal the old ones one bar earlier and
 the higher-TF columns equal the old ones at the same timestamp. Spread, volume/VWP and the 1D
-long EMAs are reported apart, since the fixes in the CHANGELOG can change them.
+long EMAs are reported apart, since the fixes in the CHANGELOG can change them. Two datasets of
+the current version (e.g. one built with `full`, one with `full` + `update`) are compared
+directly instead: on the common rows every column must be identical.
 
 > Data built before the close-label convention (no `*_bars15min_*` file next to it) is
 > rebuilt from scratch on the next `update`; scale it again with `--refit` afterwards.

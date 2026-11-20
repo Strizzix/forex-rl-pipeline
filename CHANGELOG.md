@@ -30,7 +30,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   "suspicious recurrences"; holes longer than 4 days flagged), `*_raw` columns equal to raw, and
   scalers verified against the saved cutoff window. **(AI-assisted)**
 - `compare_versions.py`: compares a dataset of the old downloader with one of the new one
-  (same bar one label later for 15min columns, same value for higher TFs). **(AI-assisted)**
+  (same bar one label later for 15min columns, same value for higher TFs), or two builds of the
+  current version directly (e.g. full build vs full build + update). **(AI-assisted)**
 - `storage.py`: every parquet carries its metadata (schema version, timestamp convention,
   indicators), also copied to the scaled parquet. **(AI-assisted)**
 

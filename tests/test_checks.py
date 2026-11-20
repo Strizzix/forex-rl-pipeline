@@ -104,3 +104,13 @@ def test_compare_old_and_new_versions(dataset):
     old["spread_mean_15min"] = np.nan  # an expected one is not
     res = compare_versions.compare(old, new)
     assert res.loc["spread_mean_15min", "expected_diff"]
+
+
+def test_compare_two_close_labelled_builds(dataset):
+    path = next((dataset / "Raw" / "Majors" / "EURUSD").glob("*_multiTF_*.parquet"))
+    a = pd.read_parquet(path)
+    meta = {"label": "close"}
+    assert compare_versions.report("EURUSD", a, a.iloc[100:], meta, meta)  # common rows agree
+    b = a.copy()
+    b["spread_mean_15min"] *= 1.5  # no exemptions between two current builds
+    assert not compare_versions.report("EURUSD", a, b, meta, meta)

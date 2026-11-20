@@ -13,6 +13,10 @@ Columns expected to differ are reported apart:
   - long EMAs on 1D (and their slopes): if the old file was extended with the old
     `update`, whose warm-up was too short for them to converge.
 
+If both files are close-labelled (two builds of the current version, e.g. a full build and
+a full build + update) they are compared directly, timestamp by timestamp, and every column
+must agree on the common rows.
+
 Usage:
     python -m data_management.compare_versions --old D:/DataOld --new D:/Data --assets EURUSD
     python -m data_management.compare_versions --old-file old.parquet --new-file new.parquet
@@ -38,13 +42,17 @@ RTOL, ATOL = 1e-7, 1e-12
 MIN_MATCH = 0.999  # share of rows that must agree
 
 
-def compare(old: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
-    """Per-column agreement between an old (open-labelled) and a new (close-labelled) frame."""
+def compare(old: pd.DataFrame, new: pd.DataFrame, same_labels: bool = False) -> pd.DataFrame:
+    """
+    Per-column agreement between an old (open-labelled) and a new (close-labelled) frame,
+    or between two close-labelled frames (same_labels=True: no shift, nothing expected
+    to differ).
+    """
     rows = []
     shifted = old.copy()
     shifted.index = shifted.index + pd.Timedelta(minutes=15)
     for c in new.columns.intersection(old.columns):
-        ref = shifted[c] if c.endswith("_15min") else old[c]
+        ref = shifted[c] if (c.endswith("_15min") and not same_labels) else old[c]
         idx = new.index.intersection(ref.index)
         a = new.loc[idx, c].to_numpy(dtype=float)
         b = ref.loc[idx].to_numpy(dtype=float)
@@ -56,7 +64,7 @@ def compare(old: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
                 "rows": len(idx),
                 "match": float(same.mean()) if len(idx) else np.nan,
                 "max_abs_diff": float(np.nanmax(diff)) if np.isfinite(diff).any() else 0.0,
-                "expected_diff": bool(EXPECTED_DIFF.match(c)),
+                "expected_diff": (not same_labels) and bool(EXPECTED_DIFF.match(c)),
             }
         )
     return pd.DataFrame(rows).set_index("column")
@@ -64,13 +72,22 @@ def compare(old: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
 
 def report(name: str, old: pd.DataFrame, new: pd.DataFrame, old_meta: dict, new_meta: dict):
     print(f"\n=== {name} ===")
-    if old_meta.get("label") == "close":
-        print("  the 'old' file is already close-labelled: nothing to compare")
-        return True
     if new_meta.get("label") != "close":
         print("  the 'new' file is not close-labelled (built by the old downloader?)")
         return False
-    res = compare(old, new)
+    same_labels = old_meta.get("label") == "close"
+    if same_labels:
+        print("  both files are close-labelled: direct comparison, every column must agree")
+        only_old_rows = old.index.difference(new.index)
+        only_new_rows = new.index.difference(old.index)
+        print(
+            f"  old {old.index.min()} -> {old.index.max()} ({len(old):,} rows)\n"
+            f"  new {new.index.min()} -> {new.index.max()} ({len(new):,} rows)\n"
+            f"  rows only in old: {len(only_old_rows):,}  only in new: {len(only_new_rows):,}"
+        )
+        if old_meta.get("indicators") != new_meta.get("indicators"):
+            print("  note: built with different indicator selections")
+    res = compare(old, new, same_labels=same_labels)
     only_old = old.columns.difference(new.columns)
     only_new = new.columns.difference(old.columns)
     if len(only_old) or len(only_new):
