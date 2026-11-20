@@ -30,6 +30,10 @@ holdout.
 3. **Anti-lookahead:** every TF above 15min is shifted by one bar before being
    forward-filled on the 15min grid, so a row only sees higher-TF bars that are
    already closed. The last 15min bar is dropped if it's still incomplete.
+
+   > **Timestamp convention:** a row is labelled with the **open** time of its 15min bar
+   > but contains that bar's close, so its features are known at `timestamp + 15min`.
+   > Downstream code (labels, backtests, live) must act at `t + 15min`, not at `t`.
 4. Warmup: it downloads extra history before `start_date` (auto: 314 days, enough
    for EMA200 on 1D, counted in trading days) and trims it.
 5. **Update mode:** reloads the existing parquet, re-downloads from
@@ -108,17 +112,25 @@ python -m data_management.scale --apply all_scalers.pkl --input new.parquet --ou
 
 `--group Majors|Minors` and `--assets EURUSD ...` work on a subset.
 
-## Tests
+## Development
 
 ```bash
-pytest
+pip install -r requirements-dev.txt
+pytest            # offline test suite
+black . && ruff check --fix .
 ```
+
+Formatting (Black) and linting (Ruff) are configured in `pyproject.toml`; GitHub Actions runs
+both plus the tests on every push. Changes are tracked in [CHANGELOG.md](CHANGELOG.md).
+
+## Tests
 
 Offline, on synthetic data:
 - cutting the 1min data at T doesn't change any row whose bar closed by T (no lookahead)
 - an update gives the same parquet as a full rebuild
 - 4H bars don't depend on the day the download starts; no partial last bar
 - the scaler fit ignores everything after the cutoff, raw columns and saved scalers round trip
+- one-sided bid/ask minutes don't double-count volume, one parquet per asset, fetch retries back off
 
 **Known limit:** EMA200 on 1D needs more history than the update warmup to fully
 converge, so after an update `EMA200_1D` can differ by ~0.1% from a full rebuild
