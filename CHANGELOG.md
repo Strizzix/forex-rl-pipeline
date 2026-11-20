@@ -8,6 +8,44 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Breaking
+- Rows are now labelled at the bar **close** time (the row `10:15` holds the bar `[10:00, 10:15)`),
+  so a timestamp is the moment its data is known and downstream code can't take a 15-minute
+  look-ahead by mistake. Higher TFs are close-labelled as well (no more `shift(1)`) and reach the
+  grid one bar earlier, still without look-ahead. Existing datasets are rebuilt automatically by
+  the next `update`; scale them again with `--refit`. **(AI-assisted)**
+
+### Added
+- `indicators.py`: indicator registry. Each indicator declares its computation, the scaler of each
+  of its columns, the history it needs and its TFs. The dataset contains the indicators listed in
+  `config.INDICATORS` (or `--indicators`); `--list-indicators` prints them. **(AI-assisted)**
+- 15min bars cache (`*_bars15min_*.parquet`): updates download only the new data and rebuild the
+  features from the cache, so an update is **identical** to a full rebuild (this removes the old
+  `EMA200_1D` known limit). **(AI-assisted)**
+- `--mode features`: rebuild the features from the cache without downloading (e.g. after changing
+  the indicator selection). **(AI-assisted)**
+- `storage.py`: every parquet carries its metadata (schema version, timestamp convention,
+  indicators), also copied to the scaled parquet. **(AI-assisted)**
+
+### Changed
+- `scale`: scalers come from the indicator registry instead of a separate name table (same choice
+  for every existing column); undeclared columns get a skewness fallback with a warning.
+  **(AI-assisted)**
+- `scale`: saved scalers fit on an older schema are refit, raw files from the older downloader are
+  refused until rebuilt, and only `*_multiTF_*` files are read (never the bars cache). **(AI-assisted)**
+- One-sided bid/ask minutes now have an unknown (`NaN`) spread instead of `0.0`, so they no longer
+  pull `spread_mean_15min` towards 0. **(AI-assisted)**
+- Indicators are built in a single concat (no fragmented DataFrames, no pandas
+  `PerformanceWarning`). **(AI-assisted)**
+- The feature schema no longer depends on the data: all-NaN columns are kept instead of dropped.
+  **(AI-assisted)**
+
+### Suggested, not applied
+- **License**: the repository has no `LICENSE` file; without one, nobody else may legally reuse the
+  code. **(AI-assisted review)**
+
+## [0.1.1] - 2026-11-20
+
 ### Fixed
 - `downloader`: minutes quoted on one side only (bid or ask) counted that side's volume twice,
   because the missing side was filled from the other before summing. The missing side now adds 0. **(AI-assisted)**
@@ -32,15 +70,3 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the offline test suite on every push. **(AI-assisted)**
 - Tests for every fix above.
 
-### Suggested, not applied
-These would change the produced data or need a design decision, so they are left for later. **(AI-assisted review)**
-- **Spread of one-sided minutes**: it is set to `0.0`, which biases `spread_mean_15min` low around market closures.
-  Leaving it `NaN` would make the 15min mean/max ignore those minutes.
-- **Timestamp convention**: rows are labelled with the bar *open* time but contain the bar close (see the README
-  note). Labelling bars at their close time would remove the risk of a 15-minute look-ahead in downstream code.
-- **`EMA200_1D` after an update**: the update warm-up is too short for the 1D EMA200 to converge exactly. Carrying the
-  last EMA values over from the existing parquet (or a longer warm-up for that TF only) would make updates match a
-  full rebuild.
-- **Performance**: `add_features` inserts columns one by one, which fragments the DataFrame (pandas
-  `PerformanceWarning`). Building the columns in a dict and concatenating once would be faster.
-- **License**: the repository has no `LICENSE` file; without one, nobody else may legally reuse the code.
