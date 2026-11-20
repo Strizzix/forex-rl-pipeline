@@ -105,6 +105,8 @@ data_management/
     downloader.py    Dukascopy download, 15min bars, multi-TF features; full / update / features
     scale.py         per-column scalers, leak-safe fit, apply saved scalers
     storage.py       parquet I/O with metadata, one file per kind and asset
+    checks.py        quality checks on the real raw / scaled data
+    compare_versions.py   old (open-labelled) vs new dataset comparison
 tests/               downloader and scaler tests on synthetic data (no download)
 ```
 
@@ -142,6 +144,32 @@ python -m data_management.scale --apply all_scalers.pkl --input new.parquet --ou
 ```
 
 `--group Majors|Minors` and `--assets EURUSD ...` work on a subset.
+
+### Checking the data
+
+```bash
+# quality checks on the real data (raw + scaled); exit status 1 if anything is wrong
+python -m data_management.checks --root D:/Data
+python -m data_management.checks --root D:/Data --only raw --assets EURUSD
+
+# old dataset (open-labelled rows) vs new one, built from the same source data
+python -m data_management.compare_versions --old D:/DataOld --new D:/Data --assets EURUSD
+```
+
+`checks` verifies, per asset: one bars cache and one features file of the current schema;
+bars on the 15min grid with consistent OHLC; exactly the columns of the selected indicators;
+**bar-close labels** (`close_15min` equals the cached bar, and at every 1H / 4H / 1D close the
+higher-TF close equals the 15min close); NaN in the first rows (warm-up too short); time gaps
+classified as weekends, holidays, short illiquid gaps or anomalies (including a gap repeating
+on the same weekday with the same length, the signature of a download bug). On the scaled
+data: same rows and indicators as raw, `*_raw` columns identical to raw, every column scaled,
+no NaN/inf added, and the scalers really fit on the cutoff window (Standard columns with mean
+0 / std 1, Robust ones with median 0, MinMax ones spanning [0, 1] on the rows up to the cutoff).
+A table at the end compares the assets and flags outliers in the share of zero-volume bars.
+
+`compare_versions` checks that the new 15min columns equal the old ones one bar earlier and
+the higher-TF columns equal the old ones at the same timestamp. Spread, volume/VWP and the 1D
+long EMAs are reported apart, since the fixes in the CHANGELOG can change them.
 
 > Data built before the close-label convention (no `*_bars15min_*` file next to it) is
 > rebuilt from scratch on the next `update`; scale it again with `--refit` afterwards.

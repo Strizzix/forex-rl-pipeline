@@ -24,6 +24,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `EMA200_1D` known limit). **(AI-assisted)**
 - `--mode features`: rebuild the features from the cache without downloading (e.g. after changing
   the indicator selection). **(AI-assisted)**
+- `checks.py`: quality checks on the real raw and scaled data, ported from the earlier
+  `Raw_Parquet_Tester` / `Scaled_Parquet_Tester` and adapted to the new layout: bar-close labels,
+  bars cache vs features, expected indicator columns, gaps (weekends no longer counted as
+  "suspicious recurrences"; holes longer than 4 days flagged), `*_raw` columns equal to raw, and
+  scalers verified against the saved cutoff window. **(AI-assisted)**
+- `compare_versions.py`: compares a dataset of the old downloader with one of the new one
+  (same bar one label later for 15min columns, same value for higher TFs). **(AI-assisted)**
 - `storage.py`: every parquet carries its metadata (schema version, timestamp convention,
   indicators), also copied to the scaled parquet. **(AI-assisted)**
 
