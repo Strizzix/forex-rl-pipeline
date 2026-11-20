@@ -1,0 +1,21 @@
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# data / models (never commit these)
+data/
+*.parquet
+*.pkl
+*.pt
+*.pth
+*.csv
+
+# editors / os
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
