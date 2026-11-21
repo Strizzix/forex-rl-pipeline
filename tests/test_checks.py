@@ -114,3 +114,13 @@ def test_compare_two_close_labelled_builds(dataset):
     b = a.copy()
     b["spread_mean_15min"] *= 1.5  # no exemptions between two current builds
     assert not compare_versions.report("EURUSD", a, b, meta, meta)
+
+
+def test_detects_closed_bars_left_in_the_features(dataset):
+    path = next((dataset / "Raw" / "Majors" / "EURUSD").glob("*_multiTF_*.parquet"))
+    df = pd.read_parquet(path)
+    sat = pd.date_range("2022-02-19 02:00", "2022-02-19 12:00", freq="15min", tz="Europe/Rome")
+    flat = df.iloc[[0] * len(sat)].set_axis(sat)
+    flat["volume_15min"] = 0.0
+    storage.write_parquet(pd.concat([df, flat]).sort_index(), path, storage.read_meta(path))
+    assert "closed-market bars left" in " ".join(_run(dataset, "raw")["raw"].errors)

@@ -203,3 +203,63 @@ def test_update_rebuilds_features_when_the_selection_changes(tmp_path):
         "2022-01-01", "2022-02-15", str(tmp_path), "EURUSD", indicator_names=["rsi"]
     ).update_parquet()  # bars already up to date: no download, features rebuilt
     assert storage.read_meta(path)["indicators"] == ["rsi"]
+
+
+def _flat_bars(start, end, price=1.1):
+    """Volume-0 flat 15min bars, close-labelled, as Dukascopy publishes them when closed."""
+    idx = pd.date_range(start, end, freq="15min", tz=TZ)
+    return pd.DataFrame(
+        {"open": price, "high": price, "low": price, "close": price, "volume": 0.0,
+         "spread_mean": np.nan, "spread_max": np.nan},
+        index=idx,
+    )  # fmt: skip
+
+
+def test_closed_market_mask_weekend_holiday_and_open_quiet_bars(bars15):
+    from data_management.downloader import closed_market_mask
+
+    b = bars15[(bars15.index > "2022-02-07") & (bars15.index < "2022-02-26")].copy()
+    weekend = _flat_bars("2022-02-12 01:15", "2022-02-13 23:00")  # Sat-Sun, market closed
+    holiday = _flat_bars("2022-02-16 02:00", "2022-02-16 09:00")  # Wed, 7h with no trading
+    b.loc[pd.Timestamp("2022-02-17 03:30", tz=TZ), "volume"] = 0.0  # one quiet bar, open
+    quiet = (b.index >= "2022-02-22 02:00") & (b.index < "2022-02-22 03:30")  # 1.5h quiet
+    b.loc[quiet, "volume"] = 0.0
+    b = pd.concat([b.drop(holiday.index, errors="ignore"), weekend, holiday]).sort_index()
+
+    mask = closed_market_mask(b)
+    assert mask[weekend.index].all() and mask[holiday.index].all()
+    assert not mask[pd.Timestamp("2022-02-17 03:30", tz=TZ)]
+    assert not mask[b.index[(b.index >= "2022-02-22 02:00") & (b.index < "2022-02-22 03:30")]].any()
+    assert not mask[b["volume"] > 0].any()  # a bar with trading is never dropped
+
+
+def test_weekly_close_follows_new_york_time():
+    from data_management.downloader import closed_market_mask
+
+    # 2022-03-13 US already on summer time, Europe not yet: New York is 5h behind Rome
+    b = _flat_bars("2022-03-13 21:45", "2022-03-13 23:15")
+    m = closed_market_mask(b, min_run_hours=100)  # weekly window only
+    # bar [21:45, 22:00) Rome opens 16:45 NY -> closed; bar [22:00, 22:15) opens 17:00 NY -> open
+    assert m[pd.Timestamp("2022-03-13 22:00", tz=TZ)]
+    assert not m[pd.Timestamp("2022-03-13 22:15", tz=TZ)]
+
+
+def test_features_skip_closed_bars_only(bars15):
+    b = pd.concat([bars15, _flat_bars("2022-02-12 01:15", "2022-02-13 23:00")]).sort_index()
+    feats = build_features(b, start="2021-12-01")
+    assert not feats.index.isin(_flat_bars("2022-02-12 01:15", "2022-02-13 23:00").index).any()
+    # identical to a dataset that never had the flat weekend bars
+    pd.testing.assert_frame_equal(feats, build_features(bars15, start="2021-12-01"))
+    kept = build_features(b, start="2021-12-01", drop_closed=False)
+    assert len(kept) > len(feats)
+
+
+def test_quiet_bars_after_the_sunday_reopening_are_kept():
+    from data_management.downloader import closed_market_mask
+
+    # flat bars from Saturday until Sunday 23:45 Rome: the market reopens at 23:00 Rome
+    # (17:00 New York), so the 3 quiet bars after it are an open session and stay
+    b = _flat_bars("2022-02-12 01:15", "2022-02-13 23:45")
+    m = closed_market_mask(b)
+    assert m[b.index <= pd.Timestamp("2022-02-13 23:00", tz=TZ)].all()
+    assert not m[b.index > pd.Timestamp("2022-02-13 23:00", tz=TZ)].any()

@@ -36,7 +36,14 @@ holdout.
    incomplete last bar is never written.
 5. Warm-up: extra history is downloaded before `start` (auto: the longest lookback of the
    selected indicators; 314 days with EMA200 on 1D, counted in trading days).
-6. **Update mode** downloads only the new data (plus a 1-day overlap), appends it to the
+6. **Closed market**: Dukascopy sometimes fills weekends and holidays with flat volume-0
+   bars and sometimes leaves them empty. Since indicators count bars, those flat bars would
+   change ATR / RSI / EMA after some weekends and not after others, so they are left out of
+   the features (they stay in the bars cache). Only volume-0 bars are dropped, and only when
+   the market is closed: in the weekly close (Friday 17:00 → Sunday 17:00 New York time, DST
+   included) or in a run of volume-0 bars lasting ≥ 4h outside it (holidays). A quiet bar of
+   an open session is always kept. Settings: `DROP_CLOSED_BARS`, `CLOSED_RUN_HOURS` in `config.py`.
+7. **Update mode** downloads only the new data (plus a 1-day overlap), appends it to the
    bars cache and rebuilds the features from the whole cache: the result is **identical
    to a full rebuild**, long EMAs included.
 
@@ -157,7 +164,8 @@ python -m data_management.compare_versions --old D:/DataOld --new D:/Data --asse
 ```
 
 `checks` verifies, per asset: one bars cache and one features file of the current schema;
-bars on the 15min grid with consistent OHLC; exactly the columns of the selected indicators;
+bars on the 15min grid with consistent OHLC; no closed-market bar left in the features and
+no open-market bar of the cache missing from them; exactly the columns of the selected indicators;
 **bar-close labels** (`close_15min` equals the cached bar, and at every 1H / 4H / 1D close the
 higher-TF close equals the 15min close); NaN in the first rows (warm-up too short); time gaps
 classified as weekends, holidays, short illiquid gaps or anomalies (including a gap repeating

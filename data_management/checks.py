@@ -7,6 +7,8 @@ Raw, for every asset in <root>/Raw/<group>/<ASSET>/:
   - features: exactly the columns of the indicators listed in its metadata;
   - bar-close labels: close_15min equals the cached bar close, and at every 1H / 4H / 1D
     boundary the higher-TF close equals the 15min close (true only with close labels);
+  - closed-market bars: none left in the features when they are dropped (weekly close or
+    long volume-0 runs), while quiet bars of open sessions are still there;
   - NaN (overall and in the first rows = warm-up too short), zero-volume and unknown-spread
     shares, time gaps classified as weekends, holidays or anomalies.
 
@@ -35,7 +37,7 @@ import numpy as np
 import pandas as pd
 
 from . import config, indicators, scale, storage
-from .downloader import BIN_ORIGIN, HIGHER_TFS
+from .downloader import BIN_ORIGIN, HIGHER_TFS, closed_market_mask
 
 # gaps between consecutive 15min rows (hours)
 WEEKEND_HOURS = (30, 80)  # starting Friday/Saturday: normal weekly close
@@ -185,7 +187,7 @@ def check_raw(pair_dir: Path, group: str, asset: str) -> Report:
     rep.info["pct_spread_nan"] = float(bars["spread_mean"].isna().mean() * 100)
 
     # features
-    if not _check_index(rep, feats.index, "features"):
+    if not _check_index(rep, feats.index, "features") or not feats.index.is_unique:
         return rep
     rep.info.update(rows=len(feats), start=feats.index.min(), end=feats.index.max())
     expected = expected_columns(meta["indicators"])
@@ -219,6 +221,27 @@ def check_raw(pair_dir: Path, group: str, asset: str) -> Report:
             rep.errors.append(
                 f"{col} != close_15min on {(~same).sum()}/{at.sum()} bar-close rows "
                 f"(timestamps not at bar close?)"
+            )
+
+    # closed-market bars
+    vol = feats[["volume_15min"]].rename(columns={"volume_15min": "volume"})
+    zero_kept = int(vol["volume"].eq(0).sum())
+    rep.info["pct_vol0_kept"] = zero_kept / max(len(feats), 1) * 100
+    if meta.get("drop_closed"):
+        closed = int(closed_market_mask(vol, meta.get("closed_run_hours")).sum())
+        if closed:
+            rep.errors.append(f"{closed} closed-market bars left in the features")
+        dropped = closed_market_mask(bars)
+        dropped = dropped[dropped.index > feats.index.min()]
+        lost = feats.index.intersection(dropped[dropped].index)
+        if len(lost):
+            rep.errors.append(f"{len(lost)} closed-market bars of the cache in the features")
+        span = (bars.index >= feats.index.min()) & (bars.index <= feats.index.max())
+        missing_open = bars.index[span & ~closed_market_mask(bars)]
+        missing_open = missing_open.difference(feats.index)
+        if len(missing_open):
+            rep.errors.append(
+                f"{len(missing_open)} open-market bars of the cache missing from the features"
             )
 
     # NaN / inf
@@ -360,6 +383,7 @@ def print_summary(reports: list):
                     "asset": f"{r.group}/{r.asset}",
                     "rows": r.info.get("rows", 0),
                     "%vol0": r.info["pct_vol0"],
+                    "%vol0 kept": r.info.get("pct_vol0_kept", np.nan),
                     "%spreadNaN": r.info["pct_spread_nan"],
                     "weekends": r.info.get("gap_weekend", 0),
                     "holidays": r.info.get("gap_holiday", 0),

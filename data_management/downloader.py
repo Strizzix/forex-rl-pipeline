@@ -126,15 +126,56 @@ def resample_bars(bars15: pd.DataFrame, tf: str) -> pd.DataFrame:
     return out.dropna(subset=OHLC)
 
 
-def build_features(bars15, start=None, names=None, trim_head=True, warmup_days=None):
+def closed_market_mask(bars: pd.DataFrame, min_run_hours=None) -> pd.Series:
+    """
+    True for the close-labelled 15min bars that fall in a market closure: volume 0 AND
+      - inside the weekly close (Friday 17:00 -> Sunday 17:00 New York time, judged on the
+        bar's open time, DST of both cities handled), or
+      - part of a run of consecutive volume-0 bars lasting >= min_run_hours outside the
+        weekly close (holidays).
+    Bars with any volume are never flagged, and a short quiet spell in an open session is
+    kept. Holidays are scheduled in advance, so using the length of the run is not a
+    look-ahead in practice.
+    """
+    hours = config.CLOSED_RUN_HOURS if min_run_hours is None else min_run_hours
+    zero = bars["volume"].eq(0)
+    open_ny = (bars.index - pd.Timedelta(minutes=15)).tz_convert(config.MARKET_TZ)
+    dow = open_ny.day_of_week
+    after_close = open_ny.hour >= config.WEEKLY_CLOSE_HOUR
+    weekend = pd.Series(
+        ((dow == 4) & after_close) | (dow == 5) | ((dow == 6) & ~after_close), index=bars.index
+    )
+    # holiday runs are measured OUTSIDE the weekly close, so the quiet first minutes after
+    # the Sunday reopening are not glued to a weekend of flat bars and dropped with it
+    zero_open = zero & ~weekend
+    run_id = zero_open.ne(zero_open.shift()).cumsum()
+    ts = bars.index.to_series()
+    run_len = ts.groupby(run_id).transform("last") - ts.groupby(run_id).transform("first")
+    long_run = zero_open & ((run_len + pd.Timedelta(minutes=15)) >= pd.Timedelta(hours=hours))
+    return (zero & weekend) | long_run
+
+
+def build_features(
+    bars15, start=None, names=None, trim_head=True, warmup_days=None, drop_closed=None
+):
     """
     15min bars -> features of every TF aligned on the 15min grid.
 
-    start     : first bar OPEN time kept (rows labelled > start); default: everything.
-    names     : indicators to include (default config.INDICATORS).
-    trim_head : also drop the first HEAD_TRIM rows (indicator warm-up noise).
+    start       : first bar OPEN time kept (rows labelled > start); default: everything.
+    names       : indicators to include (default config.INDICATORS).
+    trim_head   : also drop the first HEAD_TRIM rows (indicator warm-up noise).
+    drop_closed : leave the closed-market bars out (default config.DROP_CLOSED_BARS),
+                  before computing any indicator, on every TF.
     """
     names = indicators.validate(config.INDICATORS if names is None else names)
+    if config.DROP_CLOSED_BARS if drop_closed is None else drop_closed:
+        closed = closed_market_mask(bars15)
+        open_zero = int(bars15["volume"].eq(0).sum() - closed.sum())
+        print(
+            f"[Features] closed-market bars dropped: {int(closed.sum()):,} / {len(bars15):,}; "
+            f"volume-0 bars kept in open sessions: {open_zero:,}"
+        )
+        bars15 = bars15[~closed]
     base = indicators.compute(bars15, "15min", names).add_suffix("_15min")
     parts = [base]
     for tf in HIGHER_TFS:
@@ -294,13 +335,16 @@ class DukascopyMultiTFDownloader:
         if feats.empty:
             print(f"No valid features for {self.instrument_name}")
             return None
-        meta = {
-            "kind": "features",
-            "label": "close",
-            "start": str(start),
-            "indicators": self.indicators,
-        }
+        meta = {"kind": "features", "label": "close", "start": str(start), **self._settings()}
         return storage.save_single(feats, self.pair_dir, self.features_prefix, meta)
+
+    def _settings(self):
+        """Feature-building settings stored in the metadata (a change triggers a rebuild)."""
+        return {
+            "indicators": self.indicators,
+            "drop_closed": config.DROP_CLOSED_BARS,
+            "closed_run_hours": config.CLOSED_RUN_HOURS,
+        }
 
     # ── modes ───────────────────────────────────────────────────────────────
     def run(self):
@@ -345,9 +389,10 @@ class DukascopyMultiTFDownloader:
         if last >= self.end_date.tz_convert(self.timezone):
             print(f"[Update] bars already up to date ({last}).")
             feats_path = storage.latest(self.pair_dir, self.features_prefix)
-            if feats_path and storage.read_meta(feats_path).get("indicators") == self.indicators:
+            meta = storage.read_meta(feats_path) if feats_path else {}
+            if feats_path and all(meta.get(k) == v for k, v in self._settings().items()):
                 return feats_path
-            print("[Update] indicator selection changed -> rebuilding the features.")
+            print("[Update] indicators / closed-bar settings changed -> rebuilding the features.")
             return self._save_features(bars_old, start)
 
         fetch_from = last - UPDATE_OVERLAP

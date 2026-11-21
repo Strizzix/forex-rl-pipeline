@@ -16,6 +16,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the next `update`; scale them again with `--refit`. **(AI-assisted)**
 
 ### Added
+- Closed-market bars left out of the features: Dukascopy fills some weekends/holidays with flat
+  volume-0 bars and leaves others empty, which made indicators after a weekend depend on how it
+  was recorded. Only volume-0 bars inside the weekly close (Fri 17:00 -> Sun 17:00 New York time)
+  or in a >= 4h volume-0 run outside it are dropped; quiet bars of open sessions are kept. The
+  bars cache is unchanged, so `--mode features` applies it without downloading; `checks` verifies
+  it. **(AI-assisted)**
 - `indicators.py`: indicator registry. Each indicator declares its computation, the scaler of each
   of its columns, the history it needs and its TFs. The dataset contains the indicators listed in
   `config.INDICATORS` (or `--indicators`); `--list-indicators` prints them. **(AI-assisted)**
