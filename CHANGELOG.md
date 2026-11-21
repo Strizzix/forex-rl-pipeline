@@ -98,14 +98,39 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   with the 5-day period; it is now the FX trading day (rolls at 17:00 New York time), so Sunday
   evening counts as Monday. **(AI-assisted)**
 
+- `encoder`, strategy label execution (session breakout and PDHL), setting
+  `outcome_strict_execution` (default on; `false` gives back the earlier labels bit for bit):
+  **(AI-assisted)**
+  - fills: a trade was labelled as soon as the bar crossed the Asian high/low or PDH/PDL, but the
+    stop order sits 0.05 ATR beyond it, so bars that touched the level without reaching the entry
+    became trades that were never filled. The arming check also used the low of the same bar,
+    so a bar that opened beyond the entry counted as a fill at the entry. Now the order must be
+    resting at the bar open (previous close on the near side) and the bar must reach the entry;
+  - fill bar: the TP/SL scan started at the bar after the fill, so an SL hit in the fill bar was
+    ignored. The fill bar is now scanned: a TP there is certain, an SL is ambiguous (loss, weight 0.30);
+  - TP and SL in the same bar were labelled as a **win** (`tb <= sb`) although the comment and
+    the simulator take the SL: now a loss, weight 0.30;
+  - breakeven weights: every win with a later SL in the horizon got weight 0.35 (the BE trigger is
+    always reached on the way to TP), and a win that came back to the BE stop with no SL after it
+    kept 1.0. A win is now down-weighted only if price came back to the BE stop (entry + 0.07 R,
+    `outcome_be_offset_r`, which was read but unused) after the trigger; a BE-saved loss gets 0.35
+    also when the TP came later;
+  - horizon: it counted rows, so Friday PDHL trades were decided by Sunday's reopening gap; it now
+    stops at market breaks, and trades left open by a break or by the end of the data are skipped
+    instead of counted as "no outcome";
+  - Monday PDH/PDL came from the 2-3 hours of Sunday evening (UTC days): Monday now uses Friday;
+  - daily ATR for the entry buffer: when a day had no Asian bars it fell back to the whole day,
+    bars after the entry included; it now uses the Asian bars only.
+  The trade simulation is now in `simulate_trade` / `stop_order_filled`, covered by
+  `tests/test_strategy_labels.py`. The backtest simulator should follow the same rules, or the
+  labels and the backtest will no longer match.
+
 ### Suggested, not applied
 - **License**: the repository has no `LICENSE` file; without one, nobody else may legally reuse the
   code. **(AI-assisted review)**
-- **Encoder, days of the PDHL / Asian range**: days are UTC calendar days, so on Mondays the
-  "previous day" is the 2-3 hours of Sunday evening and the PDH/PDL of Monday are that short
-  range. Using the FX trading day (rolls at 17:00 New York) would give Monday Friday's range; to be
-  changed together with the backtest simulator, so labels and backtest keep matching.
-  **(AI-assisted review)**
+- **Encoder, spread and costs**: the strategy labels use mid prices with no spread; a long stop
+  fills on the ask and its SL triggers on the bid. Adding half the spread (`spread_mean_15min`) to
+  entry and exits would make the labels closer to live fills. **(AI-assisted review)**
 
 ## [0.1.1] - 2026-11-20
 

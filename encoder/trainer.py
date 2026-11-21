@@ -1657,6 +1657,7 @@ def train_pretrainer_with_contrastive(conf: dict[str, Any]):
         outcome_pdhl_tp_r=float(conf.get("outcome_pdhl_tp_r", 1.8)),
         outcome_pdhl_di_gate=bool(conf.get("outcome_pdhl_di_gate", True)),
         outcome_pdhl_di_thresh=float(conf.get("outcome_pdhl_di_thresh", 0.15)),
+        outcome_strict_execution=bool(conf.get("outcome_strict_execution", True)),
         outcome_pdhl_sl_r=float(conf.get("outcome_pdhl_sl_r", 1.0)),
         strategy_pdhl_horizon_bars=int(conf.get("strategy_pdhl_horizon_bars", 64)),
         # ── v28: regime quality labels ────────────────────────────────────────────

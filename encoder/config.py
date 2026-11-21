@@ -123,6 +123,8 @@ DEFAULT_CONFIG = {
     # the labels of the earlier runs back.
     "outcome_pdhl_di_gate": True,
     "outcome_pdhl_di_thresh": 0.15,
+    # executable fills, entry bar in the scan, gap-aware horizon (see dataset)
+    "outcome_strict_execution": True,
     "regime_quality_horizon_bars": 32,
     # loss weights of the strategy heads
     "w_session_head": 0.5,

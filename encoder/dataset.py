@@ -97,6 +97,153 @@ _STRUCTURAL_FEATURE_NAMES = [
 # =============================================================
 # Utilities
 # =============================================================
+# ── Trade simulation for the strategy labels ─────────────────────────────────
+W_BE_CUT = 0.35  # weight of a "win" the breakeven stop would have closed
+W_AMBIGUOUS = 0.30  # weight when the order of TP/SL inside one bar is unknown
+
+
+def previous_trading_days(dates, skip_sunday: bool = True) -> dict:
+    """
+    Map each date to the previous trading day, for PDH/PDL. With ``skip_sunday`` the
+    Sunday dates (only the evening reopening stub, in UTC) are left out, so Monday's
+    previous day is Friday.
+    """
+    days = [d for d in sorted(dates) if not (skip_sunday and d.weekday() == 6)]
+    return {days[k]: days[k - 1] for k in range(1, len(days))}
+
+
+def stop_order_filled(
+    hi: np.ndarray,
+    lo: np.ndarray,
+    close: np.ndarray,
+    break_after: np.ndarray,
+    i: int,
+    entry: float,
+    direction: int,
+) -> bool:
+    """
+    Strict fill of a stop order in bar ``i``. The order must be resting at the bar
+    open — the previous close still on the near side of the entry, with no market
+    break in between (a bar that opens beyond the entry is a gap, not a fill at the
+    entry) — and the bar must reach the entry price itself, not just the level.
+    """
+    if i < 1 or break_after[i - 1]:
+        return False
+    prev_close = float(close[i - 1])
+    if not np.isfinite(prev_close):
+        return False
+    if direction == 1:
+        return prev_close < entry and float(hi[i]) >= entry
+    return prev_close > entry and float(lo[i]) <= entry
+
+
+def simulate_trade(
+    hi: np.ndarray,
+    lo: np.ndarray,
+    e_idx: int,
+    h_eff: int,
+    tp: float,
+    sl: float,
+    direction: int,
+    *,
+    strict: bool = True,
+    last_row: Optional[int] = None,
+    h_req: Optional[int] = None,
+    be_rr: float = 0.0,
+    be_trigger_r: float = 0.25,
+    be_offset_r: float = 0.07,
+) -> tuple[np.int8, np.int8, np.int8, float]:
+    """
+    Outcome of a trade filled in bar ``e_idx``: ``(hit, side, be_reachable, weight)``.
+
+    hit 1 = TP or SL reached, 0 = neither within the horizon, -1 = unknown (strict:
+    horizon cut by a market break or by the end of the data); side 1 = TP first,
+    0 = SL first, -1 = no outcome. ``weight`` is the sample weight of the side label.
+
+    Strict (``strict=True``): the scan covers the fill bar and the ``h_eff`` bars
+    after it, up to ``last_row`` (the last row before the next market break). In the
+    fill bar a TP is certain — price opened on the near side of the entry, so it
+    crossed the entry before reaching the target — while an SL is ambiguous, since
+    the low may come before the fill: it counts as a loss with a low weight, as do
+    TP and SL inside the same bar. Historical rules (``strict=False``): the scan
+    starts at the bar after the fill and TP/SL in the same bar count as a win.
+
+    Breakeven (``be_rr`` > 0 = reward/risk of the strategy): the entry is rebuilt as
+    (tp + rr*sl) / (1 + rr) and R = |entry - sl|. be_reachable = the trigger at
+    ``be_trigger_r`` R is touched strictly before the original SL. A loss with
+    be_reachable live exits at break-even and gets a lower weight; in strict mode a
+    win gets it only if, after the trigger bar, price came back to the BE stop
+    (entry + ``be_offset_r`` R) before or in the TP bar.
+    """
+    n = len(hi)
+    if strict:
+        start = e_idx
+        stop = e_idx + h_eff + 1
+        if last_row is not None:
+            stop = min(stop, last_row + 1)
+        stop = min(stop, n)
+        truncated = stop < e_idx + (h_req if h_req is not None else h_eff) + 1
+    else:
+        start = e_idx + 1
+        stop = start + h_eff
+        truncated = False
+    fh = hi[start:stop]
+    fl = lo[start:stop]
+    no_outcome = np.int8(-1 if truncated else 0)
+    if len(fh) == 0:
+        return no_outcome, np.int8(-1), np.int8(0), 0.0
+    if direction == 1:
+        tp_h = np.flatnonzero(fh >= tp)
+        sl_h = np.flatnonzero(fl <= sl)
+    else:
+        tp_h = np.flatnonzero(fl <= tp)
+        sl_h = np.flatnonzero(fh >= sl)
+    tb = int(tp_h[0]) if len(tp_h) else None
+    sb = int(sl_h[0]) if len(sl_h) else None
+    sb_or_inf = sb if sb is not None else 10**9
+
+    be_reach = np.int8(0)
+    be_cut_win = False
+    if be_rr and be_rr > 0:
+        entry = (tp + be_rr * sl) / (1.0 + be_rr)
+        r_price = abs(entry - sl)
+        if direction == 1:
+            trig_h = np.flatnonzero(fh >= entry + be_trigger_r * r_price)
+            be_stop_hit = fl <= entry + be_offset_r * r_price
+        else:
+            trig_h = np.flatnonzero(fl <= entry - be_trigger_r * r_price)
+            be_stop_hit = fh >= entry - be_offset_r * r_price
+        # conservative: trigger and SL in the same bar -> SL, not saved
+        if len(trig_h) and int(trig_h[0]) < sb_or_inf:
+            be_reach = np.int8(1)
+            if strict and tb is not None and tb < sb_or_inf:
+                be_cut_win = bool(be_stop_hit[int(trig_h[0]) + 1 : tb + 1].any())
+
+    if tb is None and sb is None:
+        return no_outcome, np.int8(-1), be_reach, 0.0
+    hit = np.int8(1)
+    loss_w = W_BE_CUT if be_reach else 1.0
+
+    if strict:
+        if sb is not None and (sb == 0 or sb == tb):
+            return hit, np.int8(0), be_reach, W_AMBIGUOUS
+        if tb is not None and tb < sb_or_inf:
+            return hit, np.int8(1), be_reach, (W_BE_CUT if be_cut_win else 1.0)
+        return hit, np.int8(0), be_reach, loss_w
+
+    # historical rules
+    if tb is not None and sb is not None:
+        if tb == sb:
+            return hit, np.int8(1), be_reach, W_AMBIGUOUS
+        if tb < sb:
+            return hit, np.int8(1), be_reach, (W_BE_CUT if be_reach else 1.0)
+        # historical quirk: a BE-saved loss kept full weight when TP came later
+        return hit, np.int8(0), be_reach, 1.0
+    if tb is not None:
+        return hit, np.int8(1), be_reach, 1.0
+    return hit, np.int8(0), be_reach, loss_w
+
+
 def winsorize_series(a: np.ndarray, lower_pct=1.0, upper_pct=99.0) -> np.ndarray:
     if a is None:
         return a
@@ -254,6 +401,17 @@ class MarketPretrainConfig:
     # known when the order is placed (the bar before the signal).
     outcome_pdhl_di_gate: bool = True
     outcome_pdhl_di_thresh: float = 0.15
+    # Executable trade simulation for the strategy labels (session + PDHL):
+    # - the stop order fills only if it was resting at the bar open (previous
+    #   close on the right side of the entry) and the bar reaches the ENTRY price,
+    #   not just the level;
+    # - the fill bar is part of the TP/SL scan (an SL there is ambiguous);
+    # - TP and SL in the same bar count as a loss (low confidence);
+    # - a BE-protected win is down-weighted only if price came back to the BE stop;
+    # - the horizon stops at weekend/holiday gaps (unresolved -> skipped);
+    # - Monday's previous day for PDH/PDL is Friday, not the Sunday-evening stub.
+    # False reproduces the historical labels.
+    outcome_strict_execution: bool = True
 
     # ── v28: RegimeQualityHead labels ─────────────────────────────────────────
     # label=1 if the session (32 bars after end_idx) has at least 1 TP over N entries
@@ -1597,6 +1755,8 @@ class MarketPretrainDataset(Dataset):
         # to the historical behaviour instead of crashing.
         cl_raw = _get_raw("close_15min_raw")
         if cl_raw is None:
+            cl_raw = self._get_unscaled_col("close_15min")
+        if cl_raw is None:
             import numpy as _np
 
             cl_raw = _np.full(len(hi_raw) if hi_raw is not None else 0, _np.nan, dtype=float)
@@ -1656,6 +1816,10 @@ class MarketPretrainDataset(Dataset):
             _mins = np.array(_ts_idx.minute, dtype=np.int32)
             _dates = np.array([t.date() for t in _ts_idx])
             _hm = _hours * 60 + _mins
+            # rows followed by a market break (weekend, holiday): more than an
+            # hour between this bar and the next one
+            _step_min = np.diff(_ts_idx.asi8) / 6e10
+            _break_after = np.append(_step_min > 60, True)
         except Exception as _te:
             logger.warning("[DATASET] timestamp parse failed: %s — label v28 skip", _te)
             for attr in (
@@ -1709,7 +1873,25 @@ class MarketPretrainDataset(Dataset):
         _asian_by_date = {}  # date → (asian_high, asian_low, range)
         _pdh_by_date = {}  # date → (pdh, pdl, day_range)  [PREVIOUS day]
 
+        _strict = bool(getattr(cfg, "outcome_strict_execution", True))
+        _strict_fill = _strict and bool(np.isfinite(cl_raw).any())
+        if _strict and not _strict_fill:
+            logger.warning(
+                "[DATASET] %s: no real close, stop fills checked on the level only",
+                str(getattr(self, "asset_name", "")).upper(),
+            )
+        # last row before the next market break, for every row
+        _next_break = np.empty(n, dtype=np.int64)
+        _nb = n - 1
+        for _i in range(n - 1, -1, -1):
+            if _break_after[_i]:
+                _nb = _i
+            _next_break[_i] = _nb
+
         _sorted_dates = sorted(_bars_by_date.keys())
+        # previous trading day for PDH/PDL. Strict: skip Sundays, whose bars are
+        # only the evening reopening stub — Monday's previous day is Friday.
+        _prev_day = previous_trading_days(_sorted_dates, skip_sunday=_strict)
         for _i, _d in enumerate(_sorted_dates):
             _all_bars = _bars_by_date[_d]
             _asian_bars = [_b for _b in _all_bars if _asian_mask[_b]]
@@ -1720,8 +1902,8 @@ class MarketPretrainDataset(Dataset):
                 if _ar > 0 and np.isfinite(_ah) and np.isfinite(_al):
                     _asian_by_date[_d] = (_ah, _al, _ar)
 
-            if _i > 0:
-                _prev_d = _sorted_dates[_i - 1]
+            _prev_d = _prev_day.get(_d)
+            if _prev_d is not None:
                 _prev_bars = _bars_by_date[_prev_d]
                 if _prev_bars:
                     _pdh = float(np.nanmax(hi_raw[_prev_bars]))
@@ -1790,108 +1972,27 @@ class MarketPretrainDataset(Dataset):
         _be_trig_r = float(getattr(cfg, "outcome_be_trigger_r", 0.25))
         _be_off_r = float(getattr(cfg, "outcome_be_offset_r", 0.07))
 
-        def _outcome(e_idx, h_eff, tp, sl, direction):
-            """Simulates the outcome: (hit int8, side int8).
-
-            With BE on it also returns be_reachable as a third value through
-            the _be_last closure (so the signature used elsewhere doesn't change).
-            """
-            e = e_idx + 1
-            fh = hi_raw[e : e + h_eff]
-            fl = lo_raw[e : e + h_eff]
-            if len(fh) == 0:
-                _be_last[0] = np.int8(0)
-                return np.int8(0), np.int8(-1)
-            if direction == 1:
-                tp_h = np.where(fh >= tp)[0]
-                sl_h = np.where(fl <= sl)[0]
-            else:
-                tp_h = np.where(fl <= tp)[0]
-                sl_h = np.where(fh >= sl)[0]
-            any_tp = len(tp_h) > 0
-            any_sl = len(sl_h) > 0
-
-            # ── v29: be_reachable (same conservative convention as the simulator) ──
-            # The trade "reaches BE" if price touches the BE trigger BEFORE dying
-            # at the original SL. entry/R are rebuilt from sl, tp, direction and the
-            # implied rr (rr = |tp-entry|/|entry-sl|). Here we only have
-            # sl/tp/direction: the entry is the level R is measured from. In the
-            # breakout strategies the entry sits between sl and tp; the simulator
-            # uses rng = |tp-sl|/(k+tp_mult), but k/tp_mult aren't available in
-            # the dataset — so R = |entry - sl| directly, with the entry derived
-            # from the tp/sl ratio of the current strategy (passed through
-            # _be_rr). If _be_rr isn't valid, BE is off for that trade.
-            be_reach = np.int8(0)
-            if _be_on and _be_rr[0] and _be_rr[0] > 0:
-                rr = _be_rr[0]
-                if direction == 1:
-                    entry = (tp + rr * sl) / (1.0 + rr)
-                    R_price = entry - sl
-                    trig = entry + _be_trig_r * R_price
-                    # trigger touched?
-                    trig_h = np.where(fh >= trig)[0]
-                else:
-                    entry = (tp + rr * sl) / (1.0 + rr)
-                    R_price = sl - entry
-                    trig = entry - _be_trig_r * R_price
-                    trig_h = np.where(fl <= trig)[0]
-                any_trig = len(trig_h) > 0
-                if any_trig:
-                    tb_trig = int(trig_h[0])
-                    sb_orig = int(sl_h[0]) if any_sl else 10**9
-                    # CONSERVATIVE: BE "saves" the trade only if the trigger is touched
-                    # STRICTLY before the original SL (same bar -> we assume SL,
-                    # not saved).
-                    if tb_trig < sb_orig:
-                        be_reach = np.int8(1)
+        def _outcome(e_idx, h_eff, tp, sl, direction, h_req=None):
+            """(hit, side) of one trade; be_reachable and confidence go to
+            _be_last / _conf_last so the call sites stay unchanged."""
+            hit, side, be_reach, conf = simulate_trade(
+                hi_raw,
+                lo_raw,
+                e_idx,
+                h_eff,
+                tp,
+                sl,
+                direction,
+                strict=_strict,
+                last_row=int(_next_break[e_idx]),
+                h_req=h_req,
+                be_rr=_be_rr[0] if _be_on else 0.0,
+                be_trigger_r=_be_trig_r,
+                be_offset_r=_be_off_r,
+            )
             _be_last[0] = be_reach
-
-            # ── SAMPLE WEIGHT: aligned with the P&L, not with "cleanness" ─────
-            # I used to weight by the adverse excursion: telling a straight TP from
-            # a TP after -0.9R. But the result is the same — +1.8R either way —
-            # so I was asking the model to learn a distinction that's useless,
-            # taking capacity away from the one that matters. And it was applied
-            # asymmetrically between the classes, creating an imbalance that
-            # made the AUC collapse.
-            #
-            # What REALLY changes the P&L is the BREAKEVEN: at +0.25R the stop goes
-            # to break-even. A trade that goes to +0.3R, pulls back and THEN hits TP
-            # is labelled "won" but live it exits at +0.07R. Treating it as a full
-            # win teaches the model something you won't cash in.
-            #
-            # So: full weight to the outcomes the live system really gets, lower
-            # weight to those that BE turns into break-even.
-            # Symmetric by construction: it depends on the realized value, not
-            # on the label class.
-            _W_BE_CUT = 0.35  # what a "win" closed by BE is worth
-            _W_AMBIGUO = 0.30  # TP and SL in the same bar
-
-            if any_tp and any_sl:
-                tb = int(tp_h[0])
-                sb = int(sl_h[0])
-                vinto = tb <= sb
-                if tb == sb:
-                    # same bar: the simulator assumes SL to be safe, but it
-                    # doesn't know what happened inside. Unreliable label.
-                    _conf_last[0] = _W_AMBIGUO
-                elif vinto and be_reach:
-                    # it went up enough to trigger BE before coming down:
-                    # live it would have exited at break-even, not at target
-                    _conf_last[0] = _W_BE_CUT
-                else:
-                    _conf_last[0] = 1.0
-                return np.int8(1), np.int8(1 if vinto else 0)
-            elif any_tp:
-                # target hit without ever touching the stop: full outcome
-                _conf_last[0] = 1.0
-                return np.int8(1), np.int8(1)
-            elif any_sl:
-                # loss: BE turns it into break-even if it had been reached
-                _conf_last[0] = _W_BE_CUT if be_reach else 1.0
-                return np.int8(1), np.int8(0)
-            else:
-                _conf_last[0] = 0.0  # no outcome: teaches nothing
-                return np.int8(0), np.int8(-1)
+            _conf_last[0] = conf
+            return hit, side
 
         # ── ATR per day: uses _hi_raw_np/_lo_raw_np (real raw values) ─────────
         # hi_raw and lo_raw already use self._hi_raw_np when available
@@ -1900,7 +2001,9 @@ class MarketPretrainDataset(Dataset):
         if hi_raw is not None and lo_raw is not None:
             for _d, _bars in _bars_by_date.items():
                 _asian_bars_d = [_b for _b in _bars if _asian_mask[_b]]
-                _candidate_bars = _asian_bars_d if _asian_bars_d else _bars
+                # strict: Asian bars only — the whole day would use bars that
+                # come after the entry
+                _candidate_bars = _asian_bars_d if (_asian_bars_d or _strict) else _bars
                 if _candidate_bars:
                     _tr = hi_raw[_candidate_bars] - lo_raw[_candidate_bars]
                     _tr = _tr[(_tr > 0) & np.isfinite(_tr)]
@@ -1970,6 +2073,9 @@ class MarketPretrainDataset(Dataset):
         _dbg_pdhl_no_ldir = 0  # london_dir == 0
         _dbg_pdhl_labeled = 0
 
+        def _stop_filled(i, entry, direction):
+            return stop_order_filled(hi_raw, lo_raw, cl_raw, _break_after, i, entry, direction)
+
         # ── Main loop, in chronological order ─────────────────────────────────
         for end_idx in sorted(self.indices):
             remaining = n - end_idx - 1
@@ -2015,20 +2121,29 @@ class MarketPretrainDataset(Dataset):
                             _sess_davanti_long.add(_date)
                         if float(hi_raw[end_idx]) > _al:
                             _sess_davanti_short.add(_date)
-                        _long_ok = (
-                            _date not in _sess_traded_long
-                            and float(hi_raw[end_idx]) > _ah
-                            and _date in _sess_davanti_long
-                        )
-                        _short_ok = (
-                            _date not in _sess_traded_short
-                            and float(lo_raw[end_idx]) < _al
-                            and _date in _sess_davanti_short
-                        )
+                        _ep_l = _ah + 0.05 * _atr_i
+                        _ep_s = _al - 0.05 * _atr_i
+                        if _strict_fill:
+                            _long_ok = _date not in _sess_traded_long and _stop_filled(
+                                end_idx, _ep_l, +1
+                            )
+                            _short_ok = _date not in _sess_traded_short and _stop_filled(
+                                end_idx, _ep_s, -1
+                            )
+                        else:
+                            _long_ok = (
+                                _date not in _sess_traded_long
+                                and float(hi_raw[end_idx]) > _ah
+                                and _date in _sess_davanti_long
+                            )
+                            _short_ok = (
+                                _date not in _sess_traded_short
+                                and float(lo_raw[end_idx]) < _al
+                                and _date in _sess_davanti_short
+                            )
                         if not _long_ok and not _short_ok:
                             _dbg_sess_no_brk += 1
                         if _long_ok:
-                            _ep_l = _ah + 0.05 * _atr_i
                             _be_rr[0] = sess_tp_r / sess_sl_r
                             hit_sl[end_idx], side_sl[end_idx] = _outcome(
                                 end_idx,
@@ -2037,13 +2152,13 @@ class MarketPretrainDataset(Dataset):
                                 + sess_tp_r * (_asian_range / 3.0),  # RR-based TP (range/3 unit)
                                 sl=_ep_l - sess_sl_r * _asian_range / 3.0,  # range_third SL
                                 direction=+1,
+                                h_req=h_sess,
                             )
                             be_sl[end_idx] = _be_last[0]
                             cnf_sl[end_idx] = _conf_last[0]
                             _sess_traded_long.add(_date)
                             _dbg_sess_labeled += 1
                         if _short_ok:
-                            _ep_s = _al - 0.05 * _atr_i
                             _be_rr[0] = sess_tp_r / sess_sl_r
                             hit_ss[end_idx], side_ss[end_idx] = _outcome(
                                 end_idx,
@@ -2051,6 +2166,7 @@ class MarketPretrainDataset(Dataset):
                                 tp=_ep_s - sess_tp_r * (_asian_range / 3.0),  # RR-based TP
                                 sl=_ep_s + sess_sl_r * _asian_range / 3.0,  # range_third SL
                                 direction=-1,
+                                h_req=h_sess,
                             )
                             be_ss[end_idx] = _be_last[0]
                             cnf_ss[end_idx] = _conf_last[0]
@@ -2101,14 +2217,20 @@ class MarketPretrainDataset(Dataset):
                         _pdhl_davanti_long.add(_date)
                     if float(hi_raw[end_idx]) > _pdl_v:
                         _pdhl_davanti_short.add(_date)
+                    _ep_l = _pdh_v + 0.05 * _atr_i_p
+                    _ep_s = _pdl_v - 0.05 * _atr_i_p
+                    if _strict_fill:
+                        _brk_l = _stop_filled(end_idx, _ep_l, +1)
+                        _brk_s = _stop_filled(end_idx, _ep_s, -1)
+                    else:
+                        _brk_l = float(hi_raw[end_idx]) > _pdh_v and _date in _pdhl_davanti_long
+                        _brk_s = float(lo_raw[end_idx]) < _pdl_v and _date in _pdhl_davanti_short
                     if (
                         _l_dir == 1
                         and _date not in _pdhl_traded_long
-                        and float(hi_raw[end_idx]) > _pdh_v
-                        and _date in _pdhl_davanti_long
+                        and _brk_l
                         and (not _has_di or _di_dir_val > _DI_THRESH)
                     ):
-                        _ep_l = _pdh_v + 0.05 * _atr_i_p
                         _be_rr[0] = pdhl_tp_r / pdhl_sl_r
                         hit_pl[end_idx], side_pl[end_idx] = _outcome(
                             end_idx,
@@ -2116,6 +2238,7 @@ class MarketPretrainDataset(Dataset):
                             tp=_ep_l + pdhl_tp_r * (_day_range / 3.0),  # RR-based TP
                             sl=_ep_l - pdhl_sl_r * _day_range / 3.0,
                             direction=+1,
+                            h_req=h_pdhl,
                         )
                         be_pl[end_idx] = _be_last[0]
                         cnf_pl[end_idx] = _conf_last[0]
@@ -2126,11 +2249,9 @@ class MarketPretrainDataset(Dataset):
                     elif (
                         _l_dir == -1
                         and _date not in _pdhl_traded_short
-                        and float(lo_raw[end_idx]) < _pdl_v
-                        and _date in _pdhl_davanti_short
+                        and _brk_s
                         and (not _has_di or _di_dir_val < -_DI_THRESH)
                     ):
-                        _ep_s = _pdl_v - 0.05 * _atr_i_p
                         _be_rr[0] = pdhl_tp_r / pdhl_sl_r
                         hit_ps[end_idx], side_ps[end_idx] = _outcome(
                             end_idx,
@@ -2138,6 +2259,7 @@ class MarketPretrainDataset(Dataset):
                             tp=_ep_s - pdhl_tp_r * (_day_range / 3.0),
                             sl=_ep_s + pdhl_sl_r * _day_range / 3.0,
                             direction=-1,
+                            h_req=h_pdhl,
                         )
                         be_ps[end_idx] = _be_last[0]
                         cnf_ps[end_idx] = _conf_last[0]

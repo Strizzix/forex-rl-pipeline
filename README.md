@@ -133,9 +133,13 @@ embedding concatenated to every timestep. On top of the embedding:
 | `ProjectionHead` | SimCLR + cross-asset contrastive, directional contrastive (bull vs bear) |
 
 The strategy labels (`encoder/dataset.py`) are simulated on the raw 15min prices with the
-same rules as the backtest: one entry per day per direction, entry only where a pending
-order could really be placed, TP/SL hit order, breakeven reachability, and a sample weight
-that follows what the live system would actually cash in.
+same rules as the backtest: one entry per day per direction, TP/SL hit order, breakeven
+reachability, and a sample weight that follows what the live system would actually cash in.
+With `outcome_strict_execution` (default) the simulation is executable: the stop order fills
+only if it was resting at the bar open and the bar reaches the entry price; the fill bar is
+part of the TP/SL scan; anything whose order inside a bar is unknown counts as a loss with a
+low weight; the horizon stops at weekend/holiday breaks; Monday's previous day is Friday.
+`outcome_strict_execution=false` gives back the historical labels.
 
 **Training** (`encoder/trainer.py`):
 
