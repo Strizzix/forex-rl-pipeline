@@ -50,6 +50,9 @@ DEFAULT_CONFIG = {
     # Turn on at WF8 to train with the new set; compare val AUC +
     # encoder_filter_sweep against the baseline with the same WF/seed.
     "use_structural_features": False,
+    # the input must be scaled data with bar-close labels (data_management >= 0.2);
+    # True only to train on files of the older downloader anyway
+    "allow_open_labels": False,
     # ── global seed — ONLY for A/B tests (feature on/off) ───────────────────
     # use_global_seed=True makes training reproducible (same initial weights,
     # shuffle, dropout), so a baseline-vs-feature comparison isolates the effect of
@@ -115,6 +118,11 @@ DEFAULT_CONFIG = {
     "outcome_pdhl_tp_r": 1.8,
     "outcome_pdhl_sl_r": 1.0,
     "strategy_pdhl_horizon_bars": 64,
+    # PDHL DI gate (as the simulator): long only if tanh((DI+ - DI-)/20) on 4H > thresh,
+    # short only if < -thresh. It never worked before 0.2 (column case), set False to get
+    # the labels of the earlier runs back.
+    "outcome_pdhl_di_gate": True,
+    "outcome_pdhl_di_thresh": 0.15,
     "regime_quality_horizon_bars": 32,
     # loss weights of the strategy heads
     "w_session_head": 0.5,

@@ -16,6 +16,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the next `update`; scale them again with `--refit`. **(AI-assisted)**
 
 ### Added
+- `encoder`: `outcome_session_sl_r` / `outcome_pdhl_sl_r` now set the SL (multiples of range/3);
+  the default 1.0 gives the same labels as before. **(AI-assisted)**
+- `encoder`: the trainer refuses inputs without bar-close labels (older downloader) or raw /
+  bars-cache files (`allow_open_labels=true` to override), and never picks the bars cache as an
+  asset's input. **(AI-assisted)**
 - `encoder/`: the multi-head market encoder (dataset, model components, trainer), moved in from
   the research scripts `encoder_dataset.py`, `encoder_components.py`, `encoder_trainer.py`:
   package layout, a CLI (`python -m encoder.trainer`) instead of the config block with hard-coded
@@ -69,20 +74,38 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 - `checks`: `DatetimeIndex.dayofweek` (deprecated, removed in pandas 4) replaced with
   `day_of_week`; deprecation warnings raised by the package now fail the test suite. **(AI-assisted)**
+- `encoder`, time convention: sessions (Asian range 00-07 UTC, London, PDHL window), days and the
+  session input features are computed on the bar **open** time. With the close-labelled rows the
+  bar `[23:45, 00:00)` fell into the next day's Asian range and every session edge was one bar off.
+  On the same bars the strategy labels are now identical to what the encoder computed on the old
+  open-labelled data (checked bit for bit). **(AI-assisted)**
+- `encoder`, PDHL DI gate: the 4H DI columns were looked up as `DI_plus14_4H` in a frame with
+  lower-cased columns, so they were never found and the gate was silently always open (more PDHL
+  labels than the simulator trades). It now uses the real DI, `tanh((DI+ - DI-) / 20) > 0.15`
+  (short `< -0.15`) on the 4H DI known when the order is placed, as the simulator. Settings
+  `outcome_pdhl_di_gate` / `outcome_pdhl_di_thresh`; `outcome_pdhl_di_gate=false` gives back the
+  labels of the earlier runs. **(AI-assisted)**
+- `encoder`, TF closes: `hour % 4 == 0` marked the 4H closes, but the 4H bars are aligned in
+  absolute time and close at 01/05/09.. Rome in summer: the 4H trend/regime labels were taken on the
+  wrong rows half of the year. Now aligned with the data bins. **(AI-assisted)**
+- `encoder`, structural features (`use_structural_features`): `prebreak_range_atr` and
+  `day_extension_atr` were always 0 (ATR / daily columns looked up with the wrong case) and the
+  other three were computed on scaled prices, where open/high/low/close have different scalers.
+  They now use real prices (`*_raw` and inverse-transformed daily levels), and the median/IQR
+  normalization comes from the training window (saved as `structural_stats.json` next to the
+  checkpoint for live use) instead of each period's own data. **(AI-assisted)**
+- `encoder`, weekday feature: the calendar weekday made Sunday-evening bars (6) look like Tuesday
+  with the 5-day period; it is now the FX trading day (rolls at 17:00 New York time), so Sunday
+  evening counts as Monday. **(AI-assisted)**
 
 ### Suggested, not applied
 - **License**: the repository has no `LICENSE` file; without one, nobody else may legally reuse the
   code. **(AI-assisted review)**
-- **Encoder, structural features** (`use_structural_features`, off by default): the robust
-  normalization uses the median/IQR of the whole array of each dataset, validation period
-  included. Fitting it on the training window only (like the data scalers) would avoid the
-  look-ahead. **(AI-assisted review)**
-- **Encoder, PDHL label DI gate**: the sign of `DI_plus14_4H - DI_minus14_4H` is taken on the
-  *scaled* columns. With per-column scalers (MinMax since 0.1.1) that sign can differ from the
-  real one when DI+ and DI- are close; the inverse-transformed values (or `di_direction`) would
-  be exact. **(AI-assisted review)**
-- **Encoder, labels**: `outcome_session_sl_r` / `outcome_pdhl_sl_r` are in the config but not
-  used, the SL is always range/3. **(AI-assisted review)**
+- **Encoder, days of the PDHL / Asian range**: days are UTC calendar days, so on Mondays the
+  "previous day" is the 2-3 hours of Sunday evening and the PDH/PDL of Monday are that short
+  range. Using the FX trading day (rolls at 17:00 New York) would give Monday Friday's range; to be
+  changed together with the backtest simulator, so labels and backtest keep matching.
+  **(AI-assisted review)**
 
 ## [0.1.1] - 2026-11-20
 

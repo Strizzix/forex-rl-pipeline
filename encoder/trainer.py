@@ -1356,6 +1356,35 @@ def evaluate_v28_heads(
     return metrics
 
 
+def check_input_schema(asset_parquets: dict[str, str], allow_open_labels: bool = False):
+    """
+    The time logic of the dataset (sessions, Asian range, days, TF closes) assumes the
+    scaled parquets of the current data_management: rows labelled at bar close. Files of
+    the older downloader (open labels, no metadata) would shift every session by one bar,
+    and raw / bars-cache files aren't scaled at all: stop before training on them.
+    """
+    from data_management import storage
+
+    for asset, path in asset_parquets.items():
+        if not str(path).endswith(".parquet"):
+            continue
+        meta = storage.read_meta(path)
+        if meta.get("kind") in ("bars15min", "features"):
+            raise RuntimeError(
+                f"{asset}: {os.path.basename(path)} is a {meta['kind']} file, not scaled data: "
+                f"point data_dir to <root>/Scaled"
+            )
+        if meta.get("label") != "close":
+            msg = (
+                f"{asset}: {os.path.basename(path)} has no bar-close labels (built by the "
+                f"older downloader): rebuild it with data_management (downloader --mode full, "
+                f"scale --refit)"
+            )
+            if not allow_open_labels:
+                raise RuntimeError(msg + " or set allow_open_labels=true to train anyway.")
+            logger.warning(msg)
+
+
 def train_pretrainer_with_contrastive(conf: dict[str, Any]):
 
     # ── global seed for a reproducible A/B comparison (default OFF in production) ─
@@ -1564,6 +1593,7 @@ def train_pretrainer_with_contrastive(conf: dict[str, Any]):
     asset_parquets = discover_asset_parquets(base_dir, class_name, symbols)
     assets = list(asset_parquets.keys())
     logger.info(f"Assets: {assets}")
+    check_input_schema(asset_parquets, allow_open_labels=bool(conf.get("allow_open_labels", False)))
 
     TF_LIST = conf.get("tf_list", ["15min", "30min", "1h", "4h", "1d"])
     collected_feature_cols = None
@@ -1625,6 +1655,8 @@ def train_pretrainer_with_contrastive(conf: dict[str, Any]):
         strategy_session_horizon_bars=int(conf.get("strategy_session_horizon_bars", 32)),
         # ── v28: pdhl labels ──────────────────────────────────────────────────────
         outcome_pdhl_tp_r=float(conf.get("outcome_pdhl_tp_r", 1.8)),
+        outcome_pdhl_di_gate=bool(conf.get("outcome_pdhl_di_gate", True)),
+        outcome_pdhl_di_thresh=float(conf.get("outcome_pdhl_di_thresh", 0.15)),
         outcome_pdhl_sl_r=float(conf.get("outcome_pdhl_sl_r", 1.0)),
         strategy_pdhl_horizon_bars=int(conf.get("strategy_pdhl_horizon_bars", 64)),
         # ── v28: regime quality labels ────────────────────────────────────────────
@@ -1703,22 +1735,27 @@ def train_pretrainer_with_contrastive(conf: dict[str, Any]):
     train_datasets = []
     val_datasets = []
     drift_datasets = []
+    structural_stats_by_asset = {}
     for asset, p in asset_parquets.items():
         asset_key = str(asset).upper().strip()
         tr_th = per_asset_trend_thresholds.get(asset_key, {})
         spa = per_asset_scaler_paths.get(asset)
-        train_datasets.append(
-            MarketPretrainDataset(
-                df_or_path=p,
-                config=mpconf_train,
-                feature_cols=collected_feature_cols,
-                asset_name=asset,
-                scaler_path=spa,
-                slice_period=(train_start, train_end),
-                regime_thresholds={},
-                trend_thresholds=tr_th,
-            )
+        train_ds = MarketPretrainDataset(
+            df_or_path=p,
+            config=mpconf_train,
+            feature_cols=collected_feature_cols,
+            asset_name=asset,
+            scaler_path=spa,
+            slice_period=(train_start, train_end),
+            regime_thresholds={},
+            trend_thresholds=tr_th,
         )
+        train_datasets.append(train_ds)
+        # structural features: validation / drift / live use the TRAINING window's
+        # median and IQR (no statistics from the periods the model is evaluated on)
+        struct_stats = train_ds.structural_stats if mpconf_train.use_structural_features else None
+        if struct_stats is not None:
+            structural_stats_by_asset[asset_key] = struct_stats
         val_datasets.append(
             MarketPretrainDataset(
                 df_or_path=p,
@@ -1729,6 +1766,7 @@ def train_pretrainer_with_contrastive(conf: dict[str, Any]):
                 slice_period=(val_start, val_end),
                 regime_thresholds={},
                 trend_thresholds=tr_th,
+                structural_stats=struct_stats,
             )
         )
         drift_datasets.append(
@@ -1741,8 +1779,14 @@ def train_pretrainer_with_contrastive(conf: dict[str, Any]):
                 slice_period=(drift_anchor_start, drift_anchor_end),
                 regime_thresholds={},
                 trend_thresholds=tr_th,
+                structural_stats=struct_stats,
             )
         )
+    if structural_stats_by_asset:
+        _stats_path = os.path.join(results_dir, "structural_stats.json")
+        with open(_stats_path, "w") as f:
+            json.dump(structural_stats_by_asset, f, indent=2)
+        logger.info("[STRUCT] training-window normalization saved: %s", _stats_path)
 
     train_dataset = ConcatDataset(train_datasets)
     val_dataset = ConcatDataset(val_datasets)

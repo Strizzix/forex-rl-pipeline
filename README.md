@@ -114,7 +114,10 @@ scaled features of every TF, plus 7 session features (hour and weekday as sin/co
 London / New York / overlap flags) and, optionally, 5 structural features
 (`use_structural_features`). With `score_offset=1` the window ends at the bar *before*
 the signal: the model only sees closed bars, as it would live, while the labels stay on
-the signal bar.
+the signal bar. The data rows are labelled at bar close; sessions, days and the session
+features are computed on each bar's open time (the session it trades in), the weekday on
+the FX trading day (Sunday evening = Monday). Structural features use real prices and are
+normalized with the training window's statistics (`structural_stats.json`).
 
 **Model** (`encoder/components.py`): dilated causal TCN + GRU with a learnable asset
 embedding concatenated to every timestep. On top of the embedding:
@@ -125,7 +128,7 @@ embedding concatenated to every timestep. On top of the embedding:
 | `RegimeContinuousHead` | volatility regime, ATR / price, ADX, DI direction per TF |
 | `MarketStructureHead` | RANGING / LONG_BREAKOUT / SHORT_BREAKOUT per TF |
 | `SessionBreakoutHead` | P(TP before SL) of the London session breakout, long and short |
-| `PDHLBreakoutHead` | P(TP before SL) of the previous-day high/low breakout, long and short |
+| `PDHLBreakoutHead` | P(TP before SL) of the previous-day high/low breakout, long and short (London direction + 4H DI gate) |
 | `RegimeQualityHead` | is at least one of the strategies TP-first on this bar |
 | `ProjectionHead` | SimCLR + cross-asset contrastive, directional contrastive (bull vs bear) |
 
@@ -290,8 +293,11 @@ Offline, on synthetic data:
   old-schema scalers are refit, the scaler reads the features file and not the bars cache
 - one-sided bid/ask minutes: no double-counted volume, unknown spread left out of the mean
 - encoder: dataset items and label ranges, the input window ending before the signal with
-  `score_offset=1`, structural features, head output shapes, a one-epoch bootstrap through
-  the CLI whose checkpoint loads back strictly
+  `score_offset=1`, structural features (live, training-window stats), head output shapes, a
+  one-epoch bootstrap through the CLI whose checkpoint loads back strictly
+- encoder time convention: session features and weekday on the bar open time, 4H closes in
+  summer time, TF closes matching the rows where a new bar appears, PDHL DI gate applied,
+  inputs without bar-close labels refused
 
 ---
 

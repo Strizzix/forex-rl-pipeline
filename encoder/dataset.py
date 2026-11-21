@@ -33,6 +33,47 @@ except Exception:
 
 logger = logging.getLogger("encoder_trainer")
 
+# Rows of the scaled data are labelled at bar CLOSE (data_management, schema 2): the row
+# 10:15 is the bar [10:00, 10:15). Everything that depends on the time of day (sessions,
+# Asian range, days, weekday) is computed on the bar OPEN time, so a bar is assigned to the
+# session it trades in.
+BAR_MINUTES = 15
+# 4H (and 30min / 1H) bars are aligned on this origin by data_management.downloader
+BIN_ORIGIN = "2000-01-01 00:00"
+DATA_TZ = "Europe/Rome"
+# The FX trading day rolls at 17:00 New York time: Sunday evening belongs to Monday.
+FX_DAY_TZ = "America/New_York"
+FX_DAY_ROLL_HOUR = 17
+
+
+def bar_open_utc(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    """UTC open time of close-labelled 15min bars."""
+    idx = index.tz_localize(DATA_TZ) if index.tz is None else index
+    return idx.tz_convert("UTC") - pd.Timedelta(minutes=BAR_MINUTES)
+
+
+def fx_trading_weekday(open_utc: pd.DatetimeIndex) -> np.ndarray:
+    """0=Monday .. 4=Friday of the FX trading day (rolls at 17:00 New York time)."""
+    shifted = open_utc.tz_convert(FX_DAY_TZ) + pd.Timedelta(hours=24 - FX_DAY_ROLL_HOUR)
+    return np.clip(shifted.day_of_week.values, 0, 4)
+
+
+def is_tf_close(ts: pd.Timestamp, tf: str) -> bool:
+    """True if a bar of `tf` closes at the close-labelled timestamp `ts`."""
+    t = str(tf).lower()
+    if t in ("15min", "15m"):
+        return True
+    if t in ("1d", "1day"):
+        local = ts.tz_convert(DATA_TZ) if ts.tzinfo is not None else ts
+        return local.hour == 0 and local.minute == 0
+    minutes = {"30min": 30, "30m": 30, "1h": 60, "1hour": 60, "4h": 240, "4hour": 240}.get(t)
+    if minutes is None:
+        return False
+    ts = ts.tz_localize(DATA_TZ) if ts.tzinfo is None else ts
+    origin = pd.Timestamp(BIN_ORIGIN, tz=DATA_TZ)
+    return (ts - origin) % pd.Timedelta(minutes=minutes) == pd.Timedelta(0)
+
+
 _SESSION_FEATURE_NAMES = [
     "session_hour_sin",
     "session_hour_cos",
@@ -208,6 +249,11 @@ class MarketPretrainConfig:
     outcome_pdhl_tp_r: float = 1.8
     outcome_pdhl_sl_r: float = 1.0
     strategy_pdhl_horizon_bars: int = 64
+    # DI gate of the PDHL strategy (as the simulator): long only if
+    # tanh((DI+ - DI-) / 20) on 4H > thresh, short only if < -thresh, using the 4H DI
+    # known when the order is placed (the bar before the signal).
+    outcome_pdhl_di_gate: bool = True
+    outcome_pdhl_di_thresh: float = 0.15
 
     # ── v28: RegimeQualityHead labels ─────────────────────────────────────────
     # label=1 if the session (32 bars after end_idx) has at least 1 TP over N entries
@@ -417,6 +463,14 @@ def discover_scaler_files_auto(base_dir: str, class_name: str) -> dict[str, str]
     return found
 
 
+def _pick_data_file(files: list[str]) -> Optional[str]:
+    """The asset's input file: never the bars cache, the *_scaled_* file if there is one."""
+    files = [f for f in files if "_bars15min_" not in os.path.basename(f)]
+    scaled = [f for f in files if "_scaled_" in os.path.basename(f)]
+    files = sorted(scaled or files)
+    return files[0] if files else None
+
+
 def discover_asset_parquets(
     base_dir: str, class_name: str, symbols: Optional[list[str]] = None
 ) -> dict[str, str]:
@@ -437,15 +491,15 @@ def discover_asset_parquets(
                 continue
             folder = os.path.join(class_dir, s)
             if os.path.isdir(folder):
-                cands = sorted(
+                pick = _pick_data_file(
                     [
                         os.path.join(folder, f)
                         for f in os.listdir(folder)
                         if f.endswith(".parquet") or f.endswith(".csv")
                     ]
                 )
-                if cands:
-                    result[s] = cands[0]
+                if pick:
+                    result[s] = pick
                     continue
             files = [
                 f
@@ -462,15 +516,15 @@ def discover_asset_parquets(
     subdirs = [d for d in os.listdir(class_dir) if os.path.isdir(os.path.join(class_dir, d))]
     for d in subdirs:
         folder = os.path.join(class_dir, d)
-        cands = sorted(
+        pick = _pick_data_file(
             [
                 os.path.join(folder, f)
                 for f in os.listdir(folder)
                 if f.endswith(".parquet") or f.endswith(".csv")
             ]
         )
-        if cands:
-            result[d] = cands[0]
+        if pick:
+            result[d] = pick
 
     if not result:
         for f in os.listdir(class_dir):
@@ -630,8 +684,13 @@ class MarketPretrainDataset(Dataset):
         slice_period: Optional[tuple[str, str]] = None,
         regime_thresholds: Optional[dict[str, tuple[float, float]]] = None,
         trend_thresholds: Optional[dict[str, tuple[float, float]]] = None,
+        structural_stats: Optional[dict[str, tuple[float, float]]] = None,
     ):
         super().__init__()
+        # median / IQR of the structural features; None = computed on this data
+        self._structural_stats = (
+            {k: tuple(v) for k, v in structural_stats.items()} if structural_stats else None
+        )
         self._df_path = df_or_path if isinstance(df_or_path, str) else None
         self._df: Optional[pd.DataFrame] = (
             df_or_path if isinstance(df_or_path, pd.DataFrame) else None
@@ -789,129 +848,116 @@ class MarketPretrainDataset(Dataset):
             + getattr(self, "_n_structural_features", 0)
         )
 
+    def _real_col(self, df: pd.DataFrame, name: str) -> Optional[np.ndarray]:
+        """
+        Real (unscaled) values of a column: its *_raw copy if the scaler kept one, else the
+        inverse transform with the asset's scalers. None if neither is possible.
+        """
+        name = name.lower()
+        if f"{name}_raw" in df.columns:
+            return pd.to_numeric(df[f"{name}_raw"], errors="coerce").values.astype(np.float64)
+        if name not in df.columns:
+            return None
+        if self.scaler_map is None and self.scaler_path:
+            self.scaler_map = _load_all_scalers_file(self.scaler_path) or {}
+        smap = _normalize_scaler_map(self.scaler_map or {})
+        if smap.get(name) is None:
+            return None
+        return _inverse_transform_if_possible(df, name, smap).astype(np.float64)
+
     def _compute_structural_features(self, df: pd.DataFrame) -> np.ndarray:
-        """v30 — 5 structural features validated OOS, computed on EVERY bar as a
-        time series (they're symmetric, they don't depend on the trade direction).
-        Uses the raw 15min prices and the real daily levels (high_1D/low_1D/ATR14_1D):
-        the *_real columns if present, otherwise the plain ones.
+        """v30 — 5 structural features computed on EVERY bar as a time series (they're
+        symmetric, they don't depend on the trade direction), on REAL prices: the 15min
+        *_raw columns and the inverse-transformed daily levels (high_1D / low_1D / ATR14_1D).
 
         Feature order: [prebreak_range_atr, breakout_impulsivity,
                          day_extension_atr, asian_cleanliness, range_compression]
+
+        Robust normalization (x - median) / IQR, clipped to [-5, 5]. The median/IQR come
+        from `structural_stats` when given (the training window's, see the trainer) and
+        are otherwise computed on this dataset and stored in self.structural_stats, so the
+        validation and live data are normalized with the training statistics.
         Default OFF; with the flag ON they are continuous encoder inputs.
         """
         n = len(df)
         NF = len(_STRUCTURAL_FEATURE_NAMES)
-        try:
+        hi = self._real_col(df, "high_15min")
+        lo = self._real_col(df, "low_15min")
+        cl = self._real_col(df, "close_15min")
+        op = self._real_col(df, "open_15min")
+        if hi is None or lo is None or cl is None:
+            raise ValueError("structural features need the real 15min high/low/close")
+        if op is None:
+            op = cl
+        # reference ATR: real daily if available, otherwise 15min
+        atr = self._real_col(df, "atr14_1d")
+        if atr is None:
+            atr = self._real_col(df, "atr14_15min")
+        if atr is None:
+            raise ValueError("structural features need ATR14_1D or ATR14_15min")
+        atr = np.where((atr > 0) & np.isfinite(atr), atr, np.nan)
+        hi1d = self._real_col(df, "high_1d")
+        lo1d = self._real_col(df, "low_1d")
 
-            def col(name):
-                for cand in (f"{name}_real", name, f"{name}_raw"):
-                    if cand in df.columns:
-                        return df[cand].values.astype(np.float64)
-                return None
-
-            hi = col("high_15min")
-            lo = col("low_15min")
-            cl = col("close_15min")
-            op = col("open_15min")
-            if hi is None or lo is None or cl is None:
-                raise ValueError("high/low/close 15min raw missing")
-            if op is None:
-                op = cl
-            # reference ATR: real daily if available, otherwise 15min
-            atr1d = col("ATR14_1D")
-            atr15 = col("ATR14_15min")
-            atr = atr1d if atr1d is not None else atr15
-            if atr is None:
-                atr = np.full(n, np.nan)
-            atr = np.where((atr > 0) & np.isfinite(atr), atr, np.nan)
-
-            # real daily levels (for day_extension)
-            hi1d = col("high_1D")
-            lo1d = col("low_1D")
-
-            DAY = 96
-            out = np.full((n, NF), np.nan, dtype=np.float64)
-
-            # rolling helper on past windows (shift 1 so the current bar isn't used where it would look ahead)
-            hi_s = pd.Series(hi)
-            lo_s = pd.Series(lo)
-
-            # FEATURE prebreak_range_atr: max-min range of the last 8 bars / ATR
-            PRE = 8
+        hi_s, lo_s = pd.Series(hi), pd.Series(lo)
+        out = np.full((n, NF), np.nan, dtype=np.float64)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            # prebreak_range_atr: range of the last 8 CLOSED bars / ATR
+            PRE, WIDE = 8, 24
             pre_hi = hi_s.rolling(PRE).max().shift(1).values
             pre_lo = lo_s.rolling(PRE).min().shift(1).values
-            prebreak = (pre_hi - pre_lo) / atr
-
-            # FEATURE range_compression: 8-bar range / 24-bar range
-            WIDE = 24
-            wide_hi = hi_s.rolling(WIDE).max().shift(1).values
-            wide_lo = lo_s.rolling(WIDE).min().shift(1).values
-            wide_rng = wide_hi - wide_lo
-            with np.errstate(divide="ignore", invalid="ignore"):
-                rcompr = np.where(wide_rng > 0, (pre_hi - pre_lo) / wide_rng, np.nan)
-
-            # FEATURE breakout_impulsivity: sum|body| / sum range, last 3 bars
-            body = np.abs(cl - op)
-            rng = hi - lo
-            body_s = pd.Series(body).rolling(3).sum().shift(1).values
-            rng_s = pd.Series(rng).rolling(3).sum().shift(1).values
-            with np.errstate(divide="ignore", invalid="ignore"):
-                impuls = np.where(rng_s > 0, body_s / rng_s, np.nan)
-
-            # FEATURE day_extension_atr: (high_1D - low_1D corrente) / ATR
+            out[:, 0] = (pre_hi - pre_lo) / atr
+            # breakout_impulsivity: sum|body| / sum range of the last 3 bars
+            body_s = pd.Series(np.abs(cl - op)).rolling(3).sum().shift(1).values
+            rng_s = pd.Series(hi - lo).rolling(3).sum().shift(1).values
+            out[:, 1] = np.where(rng_s > 0, body_s / rng_s, np.nan)
+            # day_extension_atr: range of the last closed daily bar / ATR
             if hi1d is not None and lo1d is not None:
-                day_ext = (hi1d - lo1d) / atr
+                out[:, 2] = (hi1d - lo1d) / atr
             else:
-                # fallback: range of the developing day from the 15min bars
-                day_hi = hi_s.rolling(DAY).max().values
-                day_lo = lo_s.rolling(DAY).min().values
-                day_ext = (day_hi - day_lo) / atr
-
-            # FEATURE asian_cleanliness: directionality of close over the first 32 bars
-            # of the day (net move / total move). Rolling 32-bar approximation.
+                DAY = 96  # fallback: range of the last 96 bars
+                out[:, 2] = (
+                    hi_s.rolling(DAY).max().shift(1).values
+                    - lo_s.rolling(DAY).min().shift(1).values
+                ) / atr
+            # asian_cleanliness: net move / total move of close over the last 32 bars
             ASIA = 32
+            net = np.abs(pd.Series(cl).diff(ASIA - 1).values)
+            tot = pd.Series(np.abs(np.diff(cl, prepend=np.nan))).rolling(ASIA - 1).sum().values
+            out[:, 3] = pd.Series(np.where(tot > 0, net / tot, np.nan)).shift(1).values
+            # range_compression: 8-bar range / 24-bar range
+            wide = (
+                hi_s.rolling(WIDE).max().shift(1).values - lo_s.rolling(WIDE).min().shift(1).values
+            )
+            out[:, 4] = np.where(wide > 0, (pre_hi - pre_lo) / wide, np.nan)
 
-            def _clean(seg):
-                if len(seg) < 3:
-                    return np.nan
-                net = abs(seg[-1] - seg[0])
-                tot = np.sum(np.abs(np.diff(seg)))
-                return net / tot if tot > 0 else np.nan
-
-            clean = pd.Series(cl).rolling(ASIA).apply(_clean, raw=True).shift(1).values
-
-            out[:, 0] = prebreak
-            out[:, 1] = impuls
-            out[:, 2] = day_ext
-            out[:, 3] = clean
-            out[:, 4] = rcompr
-
-            # ── ROBUST NORMALIZATION (fixes the collapse of the auxiliary heads) ──
-            # The other features (parquet) are PRE-SCALED (~unit variance); the
-            # session ones are bounded. Leaving these as raw ratios (prebreak
-            # and day_extension can be 3-5) creates a scale imbalance that
-            # destabilizes training and collapses the TMOM head (low weight).
-            # Robust per-column standardization: (x - median)/IQR, then clip.
-            # Computed ONCE on the full array (like the other precomputes).
-            for j in range(NF):
-                col_j = out[:, j]
-                finite = col_j[np.isfinite(col_j)]
+        # Robust normalization with the given (training) statistics, or this data's.
+        # The parquet features are pre-scaled and the session ones bounded: raw ratios
+        # (prebreak / day_extension can be 3-5) would unbalance training.
+        stats = self._structural_stats
+        if stats is None:
+            stats = {}
+            for j, name in enumerate(_STRUCTURAL_FEATURE_NAMES):
+                finite = out[:, j][np.isfinite(out[:, j])]
+                med, scale = 0.0, 1.0
                 if finite.size > 100:
-                    med = np.median(finite)
+                    med = float(np.median(finite))
                     q1, q3 = np.percentile(finite, [25.0, 75.0])
-                    iqr = q3 - q1
-                    if iqr > 1e-8:
-                        scale = iqr
-                    else:
-                        sd = np.std(finite)
-                        scale = sd if sd > 1e-8 else 1.0
-                    out[:, j] = np.clip((col_j - med) / scale, -5.0, 5.0)
-            # leftover NaN (rolling warm-up) -> 0 = "typical" value after centering
-            out = np.where(np.isfinite(out), out, 0.0).astype(np.float32)
-            return out
-        except Exception as e:
-            logger.warning("Structural feature computation failed (%s). Using zeros.", e)
-            return np.zeros((n, NF), dtype=np.float32)
+                    sd = float(np.std(finite))
+                    scale = float(q3 - q1) if q3 - q1 > 1e-8 else (sd if sd > 1e-8 else 1.0)
+                stats[name] = (med, scale)
+            self._structural_stats = stats
+        for j, name in enumerate(_STRUCTURAL_FEATURE_NAMES):
+            med, scale = stats[name]
+            out[:, j] = np.clip((out[:, j] - med) / scale, -5.0, 5.0)
+        # leftover NaN (rolling warm-up) -> 0 = "typical" value after centering
+        return np.where(np.isfinite(out), out, 0.0).astype(np.float32)
+
+    @property
+    def structural_stats(self) -> Optional[dict]:
+        """Median / IQR used to normalize the structural features (None if off)."""
+        self._ensure_loaded()
+        return self._structural_stats
 
     def _compute_session_features(self, df: pd.DataFrame) -> np.ndarray:
         n = len(df)
@@ -919,7 +965,7 @@ class MarketPretrainDataset(Dataset):
             idx = df.index
             if not isinstance(idx, pd.DatetimeIndex):
                 raise ValueError("Index is not DatetimeIndex")
-            idx_utc = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
+            idx_utc = bar_open_utc(idx)  # the session a bar trades in = its open time
             h = idx_utc.hour.values.astype(np.float32)
             m = idx_utc.minute.values.astype(np.float32)
             h_frac = h + m / 60.0
@@ -929,7 +975,9 @@ class MarketPretrainDataset(Dataset):
             session_london = ((h_int >= 7) & (h_int < 16)).astype(np.float32)
             session_ny = ((h_int >= 13) & (h_int < 21)).astype(np.float32)
             session_overlap = ((h_int >= 13) & (h_int < 16)).astype(np.float32)
-            dow = idx_utc.day_of_week.values.astype(np.float32)
+            # FX trading day, 0..4: Sunday evening counts as Monday (the calendar weekday
+            # made Sunday 6 -> same sin/cos as Tuesday with a 5-day period)
+            dow = fx_trading_weekday(idx_utc).astype(np.float32)
             dow_sin = np.sin(2.0 * np.pi * dow / 5.0).astype(np.float32)
             dow_cos = np.cos(2.0 * np.pi * dow / 5.0).astype(np.float32)
         except Exception as e:
@@ -979,19 +1027,9 @@ class MarketPretrainDataset(Dataset):
         return masked.astype(np.float32), mask.astype(np.bool_)
 
     def _is_tf_close(self, ts_pd: pd.Timestamp, tf: str) -> bool:
-        minute = int(ts_pd.minute)
-        hour = int(ts_pd.hour)
-        if tf == "15min":
-            return True
-        if tf == "30min":
-            return (minute % 30) == 0
-        if tf in ("1h", "1hour"):
-            return minute == 0
-        if tf in ("4h", "4hour"):
-            return (hour % 4) == 0 and minute == 0
-        if tf == "1d":
-            return hour == 0 and minute == 0
-        return False
+        # 4H bars are aligned on BIN_ORIGIN in absolute time: in summer time they close
+        # at 01/05/09.. Rome, so `hour % 4 == 0` was wrong half of the year
+        return is_tf_close(ts_pd, tf)
 
     def _ensure_scalers_and_precompute(self):
         if self._scalers_loaded:
@@ -1593,7 +1631,10 @@ class MarketPretrainDataset(Dataset):
             if _is_major
             else float(getattr(cfg, "outcome_session_tp_r_minors", 1.8))
         )
-        # outcome_session_sl_r / outcome_pdhl_sl_r are not used: SL is always range/3
+        # SL = sl_r x (range/3), TP = tp_r x (range/3): RR = tp_r / sl_r
+        # (sl_r = 1.0 by default = the simulator's sl_type="range_third")
+        sess_sl_r = float(getattr(cfg, "outcome_session_sl_r", 1.0))
+        pdhl_sl_r = float(getattr(cfg, "outcome_pdhl_sl_r", 1.0))
         h_sess = int(getattr(cfg, "strategy_session_horizon_bars", 32))
 
         pdhl_tp_r = float(getattr(cfg, "outcome_pdhl_tp_r", 1.8))
@@ -1607,13 +1648,10 @@ class MarketPretrainDataset(Dataset):
             pdhl_tp_r,
         )
 
-        # ── Timestamp index → UTC ─────────────────────────────────────────────
+        # ── Bar OPEN time in UTC: sessions, Asian range and days by the time a bar
+        #    trades in (rows are labelled at bar close) ────────────────────────
         try:
-            _ts_idx = self._df.index
-            if hasattr(_ts_idx, "tz") and _ts_idx.tz is None:
-                _ts_idx = _ts_idx.tz_localize("UTC")
-            elif hasattr(_ts_idx, "tz") and _ts_idx.tz is not None:
-                _ts_idx = _ts_idx.tz_convert("UTC")
+            _ts_idx = bar_open_utc(self._df.index)
             _hours = np.array(_ts_idx.hour, dtype=np.int32)
             _mins = np.array(_ts_idx.minute, dtype=np.int32)
             _dates = np.array([t.date() for t in _ts_idx])
@@ -1693,10 +1731,22 @@ class MarketPretrainDataset(Dataset):
                         _pdh_by_date[_d] = (_pdh, _pdl, _dr)
 
         # ── DI direction 4H (for the PDHL gate) ──────────────────────────────
-        # uses scaled columns: the sign of (DI+ - DI-) is kept by the scaling
-        _di_plus = _get_raw("DI_plus14_4H")
-        _di_minus = _get_raw("DI_minus14_4H")
-        _has_di = _di_plus is not None and _di_minus is not None
+        # Real (inverse-transformed) DI, as the simulator's di_dir_4h = tanh((DI+ - DI-)/20).
+        # Before, the columns were looked up as "DI_plus14_4H" in a lower-cased frame:
+        # never found, so the gate was silently always open.
+        _di_dir = None
+        if bool(getattr(cfg, "outcome_pdhl_di_gate", True)):
+            _dip = self._get_unscaled_col("di_plus14_4h")
+            _dim = self._get_unscaled_col("di_minus14_4h")
+            if _dip is not None and _dim is not None:
+                _di_dir = np.tanh((_dip - _dim) / 20.0)
+            else:
+                logger.warning(
+                    "[DATASET] %s: DI+/DI- 4H missing, PDHL labels without the DI gate",
+                    _asset_upper,
+                )
+        _has_di = _di_dir is not None
+        _DI_THRESH = float(getattr(cfg, "outcome_pdhl_di_thresh", 0.15))
 
         # ── Label arrays ──────────────────────────────────────────────────────
         hit_sl = _empty()
@@ -1979,13 +2029,13 @@ class MarketPretrainDataset(Dataset):
                             _dbg_sess_no_brk += 1
                         if _long_ok:
                             _ep_l = _ah + 0.05 * _atr_i
-                            _be_rr[0] = sess_tp_r
+                            _be_rr[0] = sess_tp_r / sess_sl_r
                             hit_sl[end_idx], side_sl[end_idx] = _outcome(
                                 end_idx,
                                 h_eff_sess,
                                 tp=_ep_l
                                 + sess_tp_r * (_asian_range / 3.0),  # RR-based TP (range/3 unit)
-                                sl=_ep_l - _asian_range / 3.0,  # range_third SL
+                                sl=_ep_l - sess_sl_r * _asian_range / 3.0,  # range_third SL
                                 direction=+1,
                             )
                             be_sl[end_idx] = _be_last[0]
@@ -1994,12 +2044,12 @@ class MarketPretrainDataset(Dataset):
                             _dbg_sess_labeled += 1
                         if _short_ok:
                             _ep_s = _al - 0.05 * _atr_i
-                            _be_rr[0] = sess_tp_r
+                            _be_rr[0] = sess_tp_r / sess_sl_r
                             hit_ss[end_idx], side_ss[end_idx] = _outcome(
                                 end_idx,
                                 h_eff_sess,
                                 tp=_ep_s - sess_tp_r * (_asian_range / 3.0),  # RR-based TP
-                                sl=_ep_s + _asian_range / 3.0,  # range_third SL
+                                sl=_ep_s + sess_sl_r * _asian_range / 3.0,  # range_third SL
                                 direction=-1,
                             )
                             be_ss[end_idx] = _be_last[0]
@@ -2033,14 +2083,13 @@ class MarketPretrainDataset(Dataset):
 
                 if _pd is not None and _l_dir != 0 and _atr_i_p > 0:
                     _pdh_v, _pdl_v, _day_range = _pd
-                    # DI direction: sign of (DI+ - DI-)
-                    # (scaled columns, sign kept)
+                    # DI known when the pending order is placed: the row before the
+                    # signal (its 4H value = bars closed by the signal bar's open)
                     _di_dir_val = 0.0
-                    if _has_di:
-                        _di_dir_val = float(_di_plus[end_idx]) - float(_di_minus[end_idx])
-                    _DI_THRESH = 0.0  # relative threshold on scaled values
-                    # (the simulator's di_thresh=0.15 is on the precomputed di_dir_4h,
-                    #  which uses tanh — on scaled columns only the sign is used)
+                    if _has_di and end_idx > 0:
+                        _di_dir_val = float(_di_dir[end_idx - 1])
+                        if not np.isfinite(_di_dir_val):
+                            _di_dir_val = 0.0
 
                     # LONG: PDH breakout + London UP + DI bullish
                     # EXECUTABLE ENTRY (see sessions): without it we
@@ -2060,12 +2109,12 @@ class MarketPretrainDataset(Dataset):
                         and (not _has_di or _di_dir_val > _DI_THRESH)
                     ):
                         _ep_l = _pdh_v + 0.05 * _atr_i_p
-                        _be_rr[0] = pdhl_tp_r
+                        _be_rr[0] = pdhl_tp_r / pdhl_sl_r
                         hit_pl[end_idx], side_pl[end_idx] = _outcome(
                             end_idx,
                             h_eff_pdhl,
                             tp=_ep_l + pdhl_tp_r * (_day_range / 3.0),  # RR-based TP
-                            sl=_ep_l - _day_range / 3.0,
+                            sl=_ep_l - pdhl_sl_r * _day_range / 3.0,
                             direction=+1,
                         )
                         be_pl[end_idx] = _be_last[0]
@@ -2082,12 +2131,12 @@ class MarketPretrainDataset(Dataset):
                         and (not _has_di or _di_dir_val < -_DI_THRESH)
                     ):
                         _ep_s = _pdl_v - 0.05 * _atr_i_p
-                        _be_rr[0] = pdhl_tp_r
+                        _be_rr[0] = pdhl_tp_r / pdhl_sl_r
                         hit_ps[end_idx], side_ps[end_idx] = _outcome(
                             end_idx,
                             h_eff_pdhl,
                             tp=_ep_s - pdhl_tp_r * (_day_range / 3.0),
-                            sl=_ep_s + _day_range / 3.0,
+                            sl=_ep_s + pdhl_sl_r * _day_range / 3.0,
                             direction=-1,
                         )
                         be_ps[end_idx] = _be_last[0]

@@ -43,7 +43,15 @@ def data_root(tmp_path_factory):
         for i, asset in enumerate(["EURUSD", "GBPUSD"]):
             df1 = synth_1min(start="2021-01-01", days=420, seed=i)
             feats = build_features(make_bars(df1), start="2021-12-01")
-            scale_and_save(feats, asset, "Majors", root / "Scaled", refit=True, cutoff="2022-01-15")
+            scale_and_save(
+                feats,
+                asset,
+                "Majors",
+                root / "Scaled",
+                refit=True,
+                cutoff="2022-01-15",
+                source_meta={"label": "close"},  # as data_management.scale.main passes it
+            )
     finally:
         logging.disable(logging.NOTSET)
     return root
@@ -133,7 +141,8 @@ def test_build_config_paths(tmp_path):
     assert DEFAULT_CONFIG["augment"]["jitter"] == 0.02
 
 
-def test_trainer_smoke(data_root, tmp_path):
+@pytest.mark.parametrize("struct", [False, True])
+def test_trainer_smoke(data_root, tmp_path, struct):
     """One tiny bootstrap epoch through the CLI: checkpoints written and reloadable."""
     from encoder.trainer import main, resume_checkpoint
 
@@ -164,11 +173,14 @@ def test_trainer_smoke(data_root, tmp_path):
         "drift_max_points": 64,
         "augment": {"use_gpu_augment": False},
         "trainer": {"device": "cpu"},
+        "use_structural_features": struct,
     }
     args = ["--class", "Majors", "--mode", "bootstrap", "--root", str(data_root)]
     args += ["--results-dir", str(out), "--set"] + [f"{k}={json.dumps(v)}" for k, v in sets.items()]
     history = main(args)
     assert history["val"], "no validation epoch recorded"
+    # structural features: the training window's normalization is saved for live use
+    assert (out / "structural_stats.json").exists() == struct
 
     ckpt = out / "best_full_checkpoint.pth"
     assert ckpt.exists() and (out / "best_encoder_only.pth").exists()
@@ -194,3 +206,109 @@ def test_trainer_smoke(data_root, tmp_path):
     trend.load_state_dict(state["trend_head_state"])
     info = resume_checkpoint(str(ckpt), enc, trend)
     assert info["epoch"] == 1
+
+
+# ── time convention (rows labelled at bar close) ─────────────────────────────
+def test_session_features_use_the_bar_open_time():
+    from encoder.dataset import _SESSION_FEATURE_NAMES
+
+    idx = pd.DatetimeIndex(
+        ["2022-01-10 08:00", "2022-01-10 08:15"], tz="Europe/Rome"
+    )  # bars [06:45, 07:00) and [07:00, 07:15) UTC
+    ds = MarketPretrainDataset.__new__(MarketPretrainDataset)
+    feats = ds._compute_session_features(pd.DataFrame(index=idx))
+    london = feats[:, _SESSION_FEATURE_NAMES.index("session_london")]
+    assert list(london) == [0.0, 1.0]  # London opens at 07:00 UTC
+
+
+def test_fx_trading_weekday_rolls_at_new_york_close():
+    from encoder.dataset import bar_open_utc, fx_trading_weekday
+
+    idx = pd.DatetimeIndex(
+        ["2022-01-09 23:15", "2022-01-10 10:00", "2022-01-14 22:45", "2022-01-11 23:15"],
+        tz="Europe/Rome",
+    )  # Sun evening, Mon, Fri before the close, Tue evening after 17:00 NY
+    assert list(fx_trading_weekday(bar_open_utc(idx))) == [0, 0, 4, 2]
+
+
+def test_tf_close_follows_the_data_bins_in_summer_time():
+    from encoder.dataset import is_tf_close
+
+    rome = "Europe/Rome"
+    # 4H bins are aligned in absolute time: 00/04/08 Rome in winter, 01/05/09 in summer
+    assert is_tf_close(pd.Timestamp("2022-01-10 08:00", tz=rome), "4h")
+    assert is_tf_close(pd.Timestamp("2022-07-05 09:00", tz=rome), "4h")
+    assert not is_tf_close(pd.Timestamp("2022-07-05 08:00", tz=rome), "4h")
+    assert is_tf_close(pd.Timestamp("2022-07-05 00:00", tz=rome), "1d")
+    assert is_tf_close(pd.Timestamp("2022-07-05 09:30", tz=rome), "30min")
+
+
+def test_tf_close_matches_the_rows_where_a_new_bar_appears(data_root):
+    ds = _dataset(data_root)
+    close4h = ds._df["close_4h_raw"] if "close_4h_raw" in ds._df else ds._df["close_4h"]
+    changed = close4h.ne(close4h.shift()).to_numpy()
+    flagged = np.array([ds._is_tf_close(t, "4h") for t in ds._df.index])
+    # rows right after a market gap see a bar that closed during the gap: skip them
+    contiguous = (ds._df.index.to_series().diff() == pd.Timedelta(minutes=15)).to_numpy()
+    assert np.array_equal(changed[contiguous], flagged[contiguous])
+
+
+# ── PDHL DI gate ─────────────────────────────────────────────────────────────
+def test_pdhl_labels_respect_the_di_gate(data_root):
+    gated = _dataset(data_root, step_stride=1, outcome_pdhl_di_thresh=0.15)
+    open_ = _dataset(data_root, step_stride=1, outcome_pdhl_di_gate=False)
+    di = np.tanh(
+        (gated._get_unscaled_col("di_plus14_4h") - gated._get_unscaled_col("di_minus14_4h")) / 20
+    )
+    longs = np.where(gated._strat_hit_pdhl_long >= 0)[0]
+    shorts = np.where(gated._strat_hit_pdhl_short >= 0)[0]
+    assert (di[longs - 1] > 0.15).all() and (di[shorts - 1] < -0.15).all()
+    n_gated = len(longs) + len(shorts)
+    n_open = int((open_._strat_hit_pdhl_long >= 0).sum() + (open_._strat_hit_pdhl_short >= 0).sum())
+    assert n_gated < n_open  # the gate really filters
+
+
+# ── structural features ──────────────────────────────────────────────────────
+def test_structural_features_are_live_and_use_training_stats(data_root):
+    ds = _dataset(data_root, use_structural_features=True)
+    struct = ds.data[:, -5:]
+    assert (np.abs(struct).sum(axis=0) > 0).all()  # no feature stuck at 0
+    assert ((struct == 0).mean(axis=0) < 0.05).all()
+    stats = ds.structural_stats
+    # another dataset normalized with these statistics gives the same values
+    again = _dataset(data_root, use_structural_features=True)
+    again_stats = {k: (v[0] + 1.0, v[1]) for k, v in stats.items()}  # shifted medians
+    folder = data_root / "Scaled" / "Majors" / "EURUSD"
+    df = pd.read_parquet(glob.glob(str(folder / "*_scaled_*.parquet"))[0])
+    df.columns = [c.lower() for c in df.columns]
+    shifted = MarketPretrainDataset(
+        df,
+        MarketPretrainConfig(seq_len=64, step_stride=4, use_structural_features=True),
+        autodetect_feature_columns(df, TFS),
+        asset_name="EURUSD",
+        scaler_path=str(folder / "all_scalers.pkl"),
+        structural_stats=again_stats,
+    )
+    assert np.allclose(again.data[:, -5:], struct)
+    assert not np.allclose(shifted.data[:, -5:], struct)
+    assert shifted.structural_stats == again_stats
+
+
+# ── input discovery / schema ─────────────────────────────────────────────────
+def test_trainer_refuses_open_labelled_or_raw_inputs(tmp_path):
+    from data_management import storage
+    from encoder.dataset import discover_asset_parquets
+    from encoder.trainer import check_input_schema
+
+    folder = tmp_path / "Majors" / "EURUSD"
+    folder.mkdir(parents=True)
+    df = pd.DataFrame({"close_15min": [1.0]}, index=pd.DatetimeIndex(["2022-01-03"], tz="UTC"))
+    storage.write_parquet(df, folder / "EURUSD_bars15min_a.parquet", {"kind": "bars15min"})
+    df.to_parquet(folder / "EURUSD_scaled_a.parquet")  # no metadata: older downloader
+    found = discover_asset_parquets(str(tmp_path), "Majors")
+    assert found["EURUSD"].endswith("EURUSD_scaled_a.parquet")  # never the bars cache
+    with pytest.raises(RuntimeError, match="bar-close labels"):
+        check_input_schema(found)
+    check_input_schema(found, allow_open_labels=True)  # explicit opt-in: warning only
+    with pytest.raises(RuntimeError, match="not scaled data"):
+        check_input_schema({"EURUSD": str(folder / "EURUSD_bars15min_a.parquet")})
