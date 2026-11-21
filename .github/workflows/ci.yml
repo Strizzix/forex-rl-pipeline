@@ -14,6 +14,8 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+      # CPU-only torch: much smaller than the default CUDA wheel, enough for the tests
+      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
       - run: pip install -r requirements-dev.txt
       - name: Lint
         run: |

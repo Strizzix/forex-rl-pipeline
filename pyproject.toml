@@ -11,10 +11,10 @@ select = ["E", "W", "F", "I", "B", "UP"]
 ignore = ["E501"]  # long lines are handled by black (only strings/comments can exceed)
 
 [tool.ruff.lint.isort]
-known-first-party = ["data_management"]
+known-first-party = ["data_management", "encoder"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
 # deprecated pandas/numpy calls in our own code fail the tests (e.g. pandas 4 removals)
-filterwarnings = ["error::DeprecationWarning:data_management.*"]
+filterwarnings = ["error::DeprecationWarning:data_management.*", "error::DeprecationWarning:encoder.*", "error::FutureWarning:encoder.*"]

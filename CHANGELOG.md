@@ -16,6 +16,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the next `update`; scale them again with `--refit`. **(AI-assisted)**
 
 ### Added
+- `encoder/`: the multi-head market encoder (dataset, model components, trainer), moved in from
+  the research scripts `encoder_dataset.py`, `encoder_components.py`, `encoder_trainer.py`:
+  package layout, a CLI (`python -m encoder.trainer`) instead of the config block with hard-coded
+  paths, every setting in `encoder/config.py`, comments and logs in English, unused helpers
+  removed, Black/Ruff clean. It produces the same samples, labels, sample weights and
+  checkpoints as the scripts (checked bit for bit on synthetic data, bootstrap and retrain), and
+  old checkpoints load unchanged (same `state_dict` names). **(AI-assisted)**
+- `tests/test_encoder.py`: dataset items and label ranges, `score_offset` window, structural
+  features, head shapes, one-epoch bootstrap through the CLI with a strict checkpoint reload.
+  CI installs the CPU build of torch. **(AI-assisted)**
 - Closed-market bars left out of the features: Dukascopy fills some weekends/holidays with flat
   volume-0 bars and leaves others empty, which made indicators after a weekend depend on how it
   was recorded. Only volume-0 bars inside the weekly close (Fri 17:00 -> Sun 17:00 New York time)
@@ -42,6 +52,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   indicators), also copied to the scaled parquet. **(AI-assisted)**
 
 ### Changed
+- `encoder`: a checkpoint that doesn't load strictly is still loaded with `strict=False`, but
+  now with a warning instead of silently. **(AI-assisted)**
 - `scale`: scalers come from the indicator registry instead of a separate name table (same choice
   for every existing column); undeclared columns get a skewness fallback with a warning.
   **(AI-assisted)**
@@ -61,6 +73,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Suggested, not applied
 - **License**: the repository has no `LICENSE` file; without one, nobody else may legally reuse the
   code. **(AI-assisted review)**
+- **Encoder, structural features** (`use_structural_features`, off by default): the robust
+  normalization uses the median/IQR of the whole array of each dataset, validation period
+  included. Fitting it on the training window only (like the data scalers) would avoid the
+  look-ahead. **(AI-assisted review)**
+- **Encoder, PDHL label DI gate**: the sign of `DI_plus14_4H - DI_minus14_4H` is taken on the
+  *scaled* columns. With per-column scalers (MinMax since 0.1.1) that sign can differ from the
+  real one when DI+ and DI- are close; the inverse-transformed values (or `di_direction`) would
+  be exact. **(AI-assisted review)**
+- **Encoder, labels**: `outcome_session_sl_r` / `outcome_pdhl_sl_r` are in the config but not
+  used, the SL is always range/3. **(AI-assisted review)**
 
 ## [0.1.1] - 2026-11-20
 

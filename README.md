@@ -3,16 +3,20 @@
 End-to-end deep RL pipeline for forex: data download, preprocessing, multi-head
 encoder training and DDQN agent.
 
-I'm building it one module at a time. This first part is the **data layer**
-(`data_management/`): it downloads 1-minute bid/ask data from Dukascopy, builds
-one multi-timeframe parquet per asset with the indicators you choose, for every TF,
-aligned on a 15min grid, and scales it with per-column scalers fit without touching the
-holdout.
+I'm building it one module at a time. So far:
+
+- the **data layer** (`data_management/`): downloads 1-minute bid/ask data from Dukascopy,
+  builds one multi-timeframe parquet per asset with the indicators you choose, for every TF,
+  aligned on a 15min grid, and scales it with per-column scalers fit without touching the
+  holdout;
+- the **market encoder** (`encoder/`): a TCN-GRU network pretrained with several supervised
+  heads and contrastive losses on those parquets, retrained walk-forward every six months.
+  Its embedding is the state the DDQN agent will work on.
 
 | Module | Status |
 |---|---|
 | `data_management/` — download, features, scaling | ✅ here |
-| multi-head encoder training | coming next |
+| `encoder/` — multi-head encoder, bootstrap + walk-forward retrain | ✅ here |
 | DDQN agent | coming next |
 | live / paper trading | coming next |
 
@@ -103,6 +107,58 @@ scalers automatically. `python -m data_management.downloader --list-indicators` 
 
 ---
 
+## Encoder
+
+**Input.** Every sample is a window of `seq_len` 15min rows (256 by default) of the
+scaled features of every TF, plus 7 session features (hour and weekday as sin/cos,
+London / New York / overlap flags) and, optionally, 5 structural features
+(`use_structural_features`). With `score_offset=1` the window ends at the bar *before*
+the signal: the model only sees closed bars, as it would live, while the labels stay on
+the signal bar.
+
+**Model** (`encoder/components.py`): dilated causal TCN + GRU with a learnable asset
+embedding concatenated to every timestep. On top of the embedding:
+
+| Head | Target |
+|---|---|
+| `TrendMomentumHeadTF` | forward log-return / ATR per TF, clipped to [-3, 3] (Huber + sign penalty) |
+| `RegimeContinuousHead` | volatility regime, ATR / price, ADX, DI direction per TF |
+| `MarketStructureHead` | RANGING / LONG_BREAKOUT / SHORT_BREAKOUT per TF |
+| `SessionBreakoutHead` | P(TP before SL) of the London session breakout, long and short |
+| `PDHLBreakoutHead` | P(TP before SL) of the previous-day high/low breakout, long and short |
+| `RegimeQualityHead` | is at least one of the strategies TP-first on this bar |
+| `ProjectionHead` | SimCLR + cross-asset contrastive, directional contrastive (bull vs bear) |
+
+The strategy labels (`encoder/dataset.py`) are simulated on the raw 15min prices with the
+same rules as the backtest: one entry per day per direction, entry only where a pending
+order could really be placed, TP/SL hit order, breakeven reachability, and a sample weight
+that follows what the live system would actually cash in.
+
+**Training** (`encoder/trainer.py`):
+
+- **bootstrap** — from scratch on a fixed split (default train 2014-2022, val 2023).
+- **retrain** — walk-forward, every six months: starts from the previous WF checkpoint,
+  trains on a rolling window (4 years by default) with a phase schedule per asset class
+  (heads first, then GRU / last TCN blocks at low LR, then heads again), a KL anchor to the
+  previous model and embedding / regime drift checks. The previous model is evaluated on
+  the new validation period before training, as a baseline.
+- Loss balancing with EMA normalization, AMP on GPU, one score per epoch (trend +
+  regime + strategy-head AUCs weighted by sample coverage) to pick the best checkpoint;
+  a checkpoint is saved as `retrain_safe` only if the regime and drift checks pass.
+
+Every knob is in `encoder/config.py` (`DEFAULT_CONFIG`, commented). Checkpoints store
+plain `state_dict`s:
+
+```
+<models>/Encoder/<class>/Checkpoint/Bootstrap/best_full_checkpoint.pth   encoder + heads + optimizer
+<models>/Encoder/<class>/Checkpoint/Bootstrap/best_encoder_only.pth      encoder only
+<models>/Encoder/<class>/Checkpoint/Retrain/<tag>/retrain_full_<tag>.pth
+```
+plus `training_log_<tag>.txt`, `pretrain_history_*.json`, `best_score.json` and the drift
+baselines in the same folder.
+
+---
+
 ## Layout
 
 ```
@@ -114,10 +170,16 @@ data_management/
     storage.py       parquet I/O with metadata, one file per kind and asset
     checks.py        quality checks on the real raw / scaled data
     compare_versions.py   old (open-labelled) vs new dataset comparison
-tests/               downloader and scaler tests on synthetic data (no download)
+encoder/
+    config.py        DEFAULT_CONFIG: every training setting, paths
+    dataset.py       input windows, session/structural features, all the labels
+    components.py    TCN-GRU encoder, heads, augmentations, contrastive losses
+    trainer.py       bootstrap / walk-forward retrain, metrics, checkpoints, CLI
+tests/               data, scaler and encoder tests on synthetic data (no download, CPU)
 ```
 
-Data (root set with `--root` or the `FX_DATA_ROOT` env var):
+Data (root set with `--root` or the `FX_DATA_ROOT` env var; encoder checkpoints under
+`--models-root` or `FX_MODELS_ROOT`):
 
 ```
 <root>/Raw/<Majors|Minors>/<ASSET>/<ASSET>_bars15min_<start>_to_<end>.parquet
@@ -151,6 +213,27 @@ python -m data_management.scale --apply all_scalers.pkl --input new.parquet --ou
 ```
 
 `--group Majors|Minors` and `--assets EURUSD ...` work on a subset.
+
+### Training the encoder
+
+```bash
+# for a GPU, install the CUDA build of torch first (pytorch.org), then the requirements
+
+# bootstrap (train 2014-2022, val 2023 by default)
+python -m encoder.trainer --class Majors --mode bootstrap --root D:/Data --models-root D:/Models
+
+# walk-forward retrain from the previous WF
+python -m encoder.trainer --class Minors --mode retrain --root D:/Data --models-root D:/Models \
+    --wf-tag WF7_2026H1 --train-end 2025-12-31 --val-start 2026-01-01 --val-end 2026-06-30 \
+    --start-from D:/Models/Encoder/Minors/Checkpoint/Retrain/WF6_2025H2/retrain_full_WF6_2025H2.pth
+
+# any other setting of encoder/config.py
+python -m encoder.trainer --class Majors --mode bootstrap --set use_structural_features=true seq_len=128
+python -m encoder.trainer --config my_run.json      # several overrides in a JSON file
+```
+
+The scaled data must come from the current `data_management` (bar-close labels): an encoder
+trained on the older open-labelled data should be bootstrapped again on the new data.
 
 ### Checking the data
 
@@ -206,6 +289,9 @@ Offline, on synthetic data:
 - the scaler fit ignores everything after the cutoff, raw columns and saved scalers round trip,
   old-schema scalers are refit, the scaler reads the features file and not the bars cache
 - one-sided bid/ask minutes: no double-counted volume, unknown spread left out of the mean
+- encoder: dataset items and label ranges, the input window ending before the signal with
+  `score_offset=1`, structural features, head output shapes, a one-epoch bootstrap through
+  the CLI whose checkpoint loads back strictly
 
 ---
 
