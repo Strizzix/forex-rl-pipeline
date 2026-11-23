@@ -228,16 +228,82 @@ def _proposal(action, **kw):
     return TradeProposal(**base)
 
 
-def test_entry_filter_bool_matches_reason():
+def test_arbiter_ranks_by_advantage_without_filters():
     arbiter = TradeArbiter(copy.deepcopy(DEFAULT_CFG["arbiter_cfg"]))
+    # higher Q but a smaller advantage over HOLD ranks second; a trend trade against
+    # the trend signals isn't filtered: the agent's state already has those signals
+    a = _proposal(1, asset="EURUSD", q_value=0.9, q_hold=0.85, tmom_30m=-2.0, di_dir_4h=-0.8)
+    b = _proposal(2, asset="GBPUSD", q_value=0.3, q_hold=0.10)
+    approved = arbiter.select([a, b], remaining_trades=1)
+    assert list(approved) == ["GBPUSD"] and b.rank == 0 and a.rank == 1
+    assert a.reject_stage == "daily_quota"
+    assert a.filter_check == "trend_long_wrong_sign"  # the verdict is still recorded
+    assert arbiter.entry_filter_reason(a) == "pass"
+
+
+def test_entry_filters_are_the_same_in_train_and_eval():
+    cfg = copy.deepcopy(DEFAULT_CFG["arbiter_cfg"])
+    cfg["entry_filters"] = True
+    arbiter = TradeArbiter(cfg)
     hold = _proposal(0)
-    assert arbiter.entry_filter_reason(hold) == "hold"
-    assert not arbiter.passes_entry_filter(hold)
-    for action in (1, 2, 3, 4):
-        for mode in ("train", "eval"):
-            p = _proposal(action, tmom_30m=1.0, di_dir_4h=0.5, adx_4h=0.1, brk_prob_4h=0.2)
-            ok = arbiter.passes_entry_filter(p, mode)
-            assert ok == (arbiter.entry_filter_reason(p, mode) == "pass")
+    assert arbiter.entry_filter_reason(hold) == "hold" and not arbiter.passes_entry_filter(hold)
+    wrong = _proposal(1, tmom_30m=-1.0, adx_4h=0.5, di_dir_4h=0.5, regime_uncertainty=0.1)
+    good = _proposal(1, tmom_30m=1.0, adx_4h=0.5, di_dir_4h=0.5, regime_uncertainty=0.1)
+    for mode in ("train", "eval"):
+        assert arbiter.entry_filter_reason(wrong, mode) == "trend_long_wrong_sign"
+        assert arbiter.passes_entry_filter(good, mode)
+    legacy = TradeArbiter({**cfg, "score_mode": "legacy"})
+    assert legacy.score(good) != arbiter.score(good)
+
+
+def test_portfolio_limits_become_action_masks():
+    from agent.arbiter import MultiAssetRunner
+
+    class _Env:
+        position = None
+
+    r = MultiAssetRunner.__new__(MultiAssetRunner)
+    r.envs = {"EURUSD": _Env(), "GBPUSD": _Env()}
+    r.arbiter = TradeArbiter(copy.deepcopy(DEFAULT_CFG["arbiter_cfg"]))
+    r.block_new_trades, r.ks_enabled, r.train_daily_quota = False, False, False
+    r.MAX_CONCURRENT, r.EVAL_MAX_CONCURRENT = 2, 1
+    r.trades_opened_today = 99
+    r.mode = "train"  # no portfolio quota in training by default
+    assert r._portfolio_entry_state() == (True, "")
+    r.mode = "eval"
+    r.portfolio = type("P", (), {"daily_pnl_pct": 0.0, "daily_losses": 0})()
+    r.DAILY_BLOCK_PCT, r.DAILY_REDUCE_PCT, r.MAX_DAILY_LOSSES = -0.02, -0.01, 3
+    assert r._portfolio_entry_state() == (False, "daily_quota")
+    r.trades_opened_today = 0
+    r.envs["EURUSD"].position = {"dir": "LONG"}
+    assert r._portfolio_entry_state() == (False, "position_slots")  # eval cap = 1
+
+
+def test_replay_keeps_the_next_state_mask():
+    _seed()
+    cfg = _rainbow_cfg()
+    cfg["n_step"] = 2
+    agent = RainbowAgent(STATE_DIM, cfg, device="cpu")
+    flat, in_pos = [True] * 5, [True, False, False, False, False]
+    rng = np.random.default_rng(1)
+    for k in range(70):
+        s, ns = rng.normal(size=(2, STATE_DIM)).astype(np.float32)
+        agent.store(
+            s,
+            1 if k % 2 else 0,
+            0.1,
+            ns,
+            False,
+            env_id="EURUSD",
+            next_mask=in_pos if k % 2 else flat,
+        )
+    batch = agent.buffer.sample(32)
+    next_masks = batch[5]
+    assert next_masks.shape == (32, 5) and next_masks[:, 0].all()
+    assert (~next_masks[:, 1:]).any() and next_masks.all(dim=1).any()
+    assert np.isfinite(agent.train_step())
+    left = agent._nstep_bufs["EURUSD"].flush()  # end of the data: what's still waiting
+    assert all(len(x) == 7 for x in left)
 
 
 # ── Strategy outcome labels ───────────────────────────────────────────────────
@@ -367,6 +433,14 @@ def test_env_state_and_steps(models_root, data_root):
             break
     # the strategy head is live: P(TP) isn't the neutral 0.25 default
     assert env._strat_p_tp_tl != 0.25
+    # the action mask is the same in training: no new trade with a position open
+    env.training_mode = "train"
+    env.position = env.position or {"dir": "LONG", "entry": 1.0, "sl": 0.9, "tp": 1.2}
+    assert env.get_valid_action_mask() == [True, False, False, False, False]
+    env.position = None
+    lockout = [i for i, ts in enumerate(env.timestamps) if ts.weekday() == 2 and ts.hour == 21]
+    env.current_step = lockout[0]  # Wednesday 21:00 UTC: before the force close
+    assert env.get_valid_action_mask() == [True, False, False, False, False]
 
 
 # ── Config and CLI ────────────────────────────────────────────────────────────
@@ -428,5 +502,9 @@ def test_pipeline_cli_one_wf(data_root, models_root, tmp_path):
     assert agent_ckpt and "Exploration" in agent_ckpt
     reloaded = RainbowAgent(STATE_DIM, _rainbow_cfg(), device="cpu")
     reloaded.load(agent_ckpt)
-    summaries = glob.glob(str(models_root / "Rainbow" / "runs" / "**" / "*.json"), recursive=True)
+    summaries = glob.glob(
+        str(models_root / "Rainbow" / "runs" / "**" / "eval_summary_*.json"), recursive=True
+    )
     assert summaries
+    report = json.load(open(summaries[0]))["counterfactual"]
+    assert "decisions" in report  # the agent's eval decisions replayed

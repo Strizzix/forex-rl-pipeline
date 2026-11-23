@@ -99,12 +99,14 @@ def trade_labels(
     rr: float,
     direction: int,
     max_horizon: int = 600,
-) -> tuple[np.ndarray, np.ndarray]:
+    return_r: bool = False,
+):
     """
     Outcome of a trade opened at the close of every bar (direction +1 long, -1 short).
     Returns (hit, side), int8: hit 1 = SL or TP touched before the force close, 0 = closed
     by the force close, -1 = unknown (no ATR, data ends first); side 1 = TP first,
-    0 = SL first, -1 = not touched.
+    0 = SL first, -1 = not touched. With return_r also the result in R: rr at the TP,
+    -1 at the SL, the move to the force-close bar's close otherwise, NaN if unknown.
     """
     n = len(close)
     entry = close + direction * np.nan_to_num(spread, nan=0.0)
@@ -114,6 +116,7 @@ def trade_labels(
     valid = np.isfinite(entry) & np.isfinite(risk) & (risk > 0)
     hit = np.zeros(n, dtype=np.int8)
     side = np.full(n, -1, dtype=np.int8)
+    r_mult = np.full(n, np.nan)
     open_ = valid.copy()
     for k in range(1, min(max_horizon, n - 1) + 1):
         if not open_.any():
@@ -128,18 +131,24 @@ def trade_labels(
         r = rows[touched]
         hit[r] = 1
         side[r] = np.where(sl_hit[touched], 0, 1)  # SL first on a same-bar collision
+        r_mult[r] = np.where(sl_hit[touched], -1.0, rr)
         open_[r] = False
         # force close at the end of this bar (after its SL/TP check)
         fc = rows[~touched & force_close[rows + k]]
+        r_mult[fc] = direction * (close[fc + k] - entry[fc]) / risk[fc]
         open_[fc] = False
     unknown = ~valid | open_  # still open: the data (or max_horizon) ended first
     hit[unknown] = -1
     side[unknown] = -1
-    return hit, side
+    r_mult[unknown] = np.nan
+    return (hit, side, r_mult) if return_r else (hit, side)
 
 
-def strategy_labels(df: pd.DataFrame, env_cfg: dict, max_horizon: int = 600):
-    """hit, side [n, 4] in StrategyOutcomeHead.COMBOS order, from the env's raw columns."""
+def strategy_labels(
+    df: pd.DataFrame, env_cfg: dict, max_horizon: int = 600, return_r: bool = False
+):
+    """hit, side (and R) [n, 4] in StrategyOutcomeHead.COMBOS order, from the env's raw columns.
+    Action a (1..4) of the env is combo a - 1."""
     cols = {str(c).lower(): c for c in df.columns}
 
     def raw(name, default=None):
@@ -161,15 +170,17 @@ def strategy_labels(df: pd.DataFrame, env_cfg: dict, max_horizon: int = 600):
         "trend": (float(env_cfg.get("sl_atr_mult", 1.0)), float(env_cfg.get("rr", 1.8))),
         "mr": (float(env_cfg.get("sl_atr_mult_mr", 1.0)), float(env_cfg.get("rr_mr", 1.0))),
     }
-    hits, sides = [], []
+    hits, sides, rs = [], [], []
     for si, di, _ in StrategyOutcomeHead.COMBOS:
         sl_mult, rr = params[StrategyOutcomeHead.STRATEGIES[si]]
-        h, s = trade_labels(
-            close, high, low, atr, spread, fc, sl_mult, rr, 1 if di == 0 else -1, max_horizon
+        h, s, r = trade_labels(
+            close, high, low, atr, spread, fc, sl_mult, rr, 1 if di == 0 else -1, max_horizon, True
         )
         hits.append(h)
         sides.append(s)
-    return np.stack(hits, axis=1), np.stack(sides, axis=1)
+        rs.append(r)
+    out = (np.stack(hits, axis=1), np.stack(sides, axis=1))
+    return out + (np.stack(rs, axis=1),) if return_r else out
 
 
 # ── embeddings and training ───────────────────────────────────────────────────

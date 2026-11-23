@@ -19,7 +19,6 @@ come from the encoder package, so the agent sees exactly what the encoder was tr
 """
 
 import logging
-import math
 import os
 from collections import deque
 from datetime import timezone
@@ -864,31 +863,25 @@ class MarketEnv:
         return min(float(self.cfg.get("max_lot", 10.0)), max(self.min_lot, round(lots, 2)))
 
     def get_valid_action_mask(self, max_trades_override=None):
-        """5-action mask: [HOLD, LONG_TREND, SHORT_TREND, LONG_MR, SHORT_MR]"""
-        if self.training_mode == "train" and self.cfg.get("mask_mode", "explore") == "explore":
-            return [True, True, True, True, True]
-
+        """
+        [HOLD, LONG_TREND, SHORT_TREND, LONG_MR, SHORT_MR]: the trades this env can open now,
+        the same in training and eval. No trade with a position open, in the entry lockouts
+        (Wednesday / Friday before the close, Sunday reopen), after the day's trades or
+        without daily drawdown budget for one more stop. HOLD is always available.
+        Market conditions (ADX, trend...) are not here: the agent learns them from the state.
+        """
+        idx = min(self.current_step, len(self.df) - 1)
         max_trades = max_trades_override or self.max_trades_per_day
-        in_position = self.position is not None
-        can_trade = (not in_position) and (self.trades_today < max_trades)
-
-        remaining_dd = max(0.0, self.daily_dd_limit - self.daily_dd)
-        risk_pct = self.cfg.get("trade_risk_pct", 0.005)
-        max_trades_left = int(
-            math.floor((self.balance * remaining_dd) / max(1e-12, self.balance * risk_pct))
+        can_trade = (
+            self.position is None
+            and self.trades_today < max_trades
+            and not self._is_entry_lockout(idx)
         )
-        if max_trades_left <= 0:
-            can_trade = False
-
-        adx_4h = float(getattr(self, "_adx_4h", -1.0))
-        if adx_4h < 0:
-            trend_ok = can_trade
-            mr_ok = can_trade
-        else:
-            trend_ok = can_trade and (adx_4h >= self.adx_trend_min)
-            mr_ok = can_trade and (adx_4h < self.adx_ranging_max)
-
-        return [True, trend_ok, trend_ok, mr_ok, mr_ok]
+        if can_trade:
+            remaining_dd = max(0.0, self.daily_dd_limit - self.daily_dd)
+            risk_pct = float(self.cfg.get("trade_risk_pct", 0.005))
+            can_trade = remaining_dd >= risk_pct
+        return [True] + [bool(can_trade)] * 4
 
     def _open_position(
         self,

@@ -224,8 +224,10 @@ class PrioritizedReplayBuffer:
         beta_steps: int = 300_000,
         min_priority: float = 1e-6,
         device: str = "cpu",
+        n_actions: int = _N_ACTIONS,
     ):
         self.capacity = capacity
+        self.n_actions = n_actions
         self.alpha = alpha
         self.beta_start = beta_start
         self.beta_end = beta_end
@@ -242,6 +244,8 @@ class PrioritizedReplayBuffer:
         self._rewards = np.zeros(capacity, dtype=np.float32)
         self._next_states = np.empty(capacity, dtype=object)
         self._dones = np.zeros(capacity, dtype=np.bool_)
+        # actions available in the next state (the Double DQN target picks among these)
+        self._next_masks = np.ones((capacity, n_actions), dtype=np.bool_)
 
     # ── write ───────────────────────────────────────────────────────
     def add(
@@ -252,6 +256,7 @@ class PrioritizedReplayBuffer:
         next_state: np.ndarray,
         done: bool,
         tag: str = "hold",
+        next_mask=None,
     ):
         max_p = self.tree.max_priority(default=1.0)
         mult = self._TAG_PRIORITY_MULT.get(tag, 1.0)
@@ -271,6 +276,7 @@ class PrioritizedReplayBuffer:
             else np.array(next_state, dtype=np.float32)
         )
         self._dones[idx] = bool(done)
+        self._next_masks[idx] = True if next_mask is None else np.asarray(next_mask, dtype=bool)
 
     # ── read ────────────────────────────────────────────────────────
     @property
@@ -281,7 +287,8 @@ class PrioritizedReplayBuffer:
     def sample(self, batch_size: int) -> tuple | None:
         """
         Samples proportionally to the priority.
-        Returns (states, actions, rewards, next_states, dones, indices, weights) or None.
+        Returns (states, actions, rewards, next_states, dones, next_masks, indices, weights)
+        or None.
         """
         n = self.tree.size
         if n < batch_size:
@@ -320,8 +327,9 @@ class PrioritizedReplayBuffer:
         rewards = torch.tensor(self._rewards[indices], dtype=torch.float32).to(self.device)
         dones = torch.tensor(self._dones[indices], dtype=torch.float32).to(self.device)
         weights = torch.tensor(weights, dtype=torch.float32).to(self.device)
+        next_masks = torch.tensor(self._next_masks[indices], dtype=torch.bool).to(self.device)
 
-        return states, actions, rewards, next_states, dones, indices, weights
+        return states, actions, rewards, next_states, dones, next_masks, indices, weights
 
     def update_priorities(self, indices: np.ndarray, priorities: np.ndarray):
         for idx, p in zip(indices, priorities):
@@ -339,6 +347,7 @@ class PrioritizedReplayBuffer:
         self._rewards = np.zeros(self.capacity, dtype=np.float32)
         self._next_states = np.empty(self.capacity, dtype=object)
         self._dones = np.zeros(self.capacity, dtype=np.bool_)
+        self._next_masks = np.ones((self.capacity, self.n_actions), dtype=np.bool_)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -349,7 +358,7 @@ class NStepBuffer:
     Rolling buffer for N-step returns, per asset.
     Accumulates the last n transitions and computes the discounted return:
         R = r_t + γ·r_{t+1} + ... + γ^{n-1}·r_{t+n-1}
-    then releases (s_t, a_t, R, s_{t+n}, done_{t+n}).
+    then releases (s_t, a_t, R, s_{t+n}, done_{t+n}, tag, mask_{t+n}).
 
     CRITICAL: one instance per asset, so independent sequences
     never get mixed.
@@ -368,46 +377,68 @@ class NStepBuffer:
         next_state: Any,
         done: bool,
         tag: str,
+        next_mask=None,
     ) -> list[tuple]:
         """
         Adds a transition.
-        Returns a list of (s, a, R, ns, done, tag) ready for the replay buffer.
+        Returns a list of (s, a, R, ns, done, tag, next_mask) ready for the replay buffer.
         """
-        self._buf.append((state, action, reward, next_state, done, tag))
+        self._buf.append((state, action, reward, next_state, done, tag, next_mask))
         ready = []
 
         if done:
             # flush: n-step return for every transition left
             buf_list = list(self._buf)
             for i in range(len(buf_list)):
-                s_i, a_i, _, _, _, tag_i = buf_list[i]
+                s_i, a_i, _, _, _, tag_i, _ = buf_list[i]
                 R = 0.0
                 actual_ns = buf_list[-1][3]
                 actual_done = True
-                for j, (_, _, r_j, ns_j, d_j, _) in enumerate(buf_list[i:]):
+                actual_mask = buf_list[-1][6]
+                for j, (_, _, r_j, ns_j, d_j, _, m_j) in enumerate(buf_list[i:]):
                     R += (self.gamma**j) * r_j
                     actual_ns = ns_j
                     actual_done = d_j
+                    actual_mask = m_j
                     if d_j:
                         break
-                ready.append((s_i, a_i, R, actual_ns, actual_done, tag_i))
+                ready.append((s_i, a_i, R, actual_ns, actual_done, tag_i, actual_mask))
             self._buf.clear()
 
         elif len(self._buf) == self.n:
             # buffer full: release the oldest transition
             buf_list = list(self._buf)
-            s0, a0, _, _, _, tag0 = buf_list[0]
+            s0, a0, _, _, _, tag0, _ = buf_list[0]
             R = 0.0
             actual_ns = buf_list[-1][3]
             actual_done = buf_list[-1][4]
-            for j, (_, _, r_j, ns_j, d_j, _) in enumerate(buf_list):
+            actual_mask = buf_list[-1][6]
+            for j, (_, _, r_j, ns_j, d_j, _, m_j) in enumerate(buf_list):
                 R += (self.gamma**j) * r_j
                 if d_j:
                     actual_ns = ns_j
                     actual_done = True
+                    actual_mask = m_j
                     break
-            ready.append((s0, a0, R, actual_ns, actual_done, tag0))
+            ready.append((s0, a0, R, actual_ns, actual_done, tag0, actual_mask))
 
+        return ready
+
+    def flush(self) -> list[tuple]:
+        """Releases the transitions still waiting (end of an episode without done)."""
+        buf_list = list(self._buf)
+        ready = []
+        for i in range(len(buf_list)):
+            s_i, a_i, _, _, _, tag_i, _ = buf_list[i]
+            R = 0.0
+            actual_ns, actual_done, actual_mask = buf_list[-1][3], True, buf_list[-1][6]
+            for j, (_, _, r_j, ns_j, d_j, _, m_j) in enumerate(buf_list[i:]):
+                R += (self.gamma**j) * r_j
+                actual_ns, actual_done, actual_mask = ns_j, d_j, m_j
+                if d_j:
+                    break
+            ready.append((s_i, a_i, R, actual_ns, actual_done, tag_i, actual_mask))
+        self._buf.clear()
         return ready
 
     def reset(self):
@@ -593,6 +624,7 @@ class RainbowAgent:
             beta_end=per_beta_end,
             beta_steps=per_beta_steps,
             device=device,
+            n_actions=self.n_actions,
         )
 
         # ── Elite buffer ─────────────────────────────────────────────
@@ -656,6 +688,11 @@ class RainbowAgent:
         q = q.clone()
         q[~mask_t] = -1e9
         return q
+
+    def _mask_array(self, mask) -> np.ndarray:
+        if mask is None:
+            return np.ones(self.n_actions, dtype=bool)
+        return np.asarray(mask, dtype=bool)
 
     def _get_nstep_buf(self, env_id: str | None) -> NStepBuffer:
         """Gets or creates the NStepBuffer of the given asset."""
@@ -734,13 +771,17 @@ class RainbowAgent:
         q = self._mask_q(q, mask)
         return int(q.argmax().item())
 
-    def store(self, state, action, reward, next_state, done, tag="hold", env_id=None):
+    def store(
+        self, state, action, reward, next_state, done, tag="hold", env_id=None, next_mask=None
+    ):
         """
         Adds a transition to the N-step buffer of the asset (env_id),
         then moves the ready transitions into the PER replay buffer.
 
-        env_id:  asset id, e.g. "EURUSD".
-                 None = a single buffer (backward compatible).
+        env_id:     asset id, e.g. "EURUSD".
+                    None = a single buffer (backward compatible).
+        next_mask:  actions available in next_state (None = all): the Double DQN
+                    target only looks at actions that could actually be taken there.
         """
         if self.reward_clip > 0:
             # Asymmetric: positive rewards clipped at reward_clip (1.0),
@@ -754,9 +795,9 @@ class RainbowAgent:
         ns_np = self._to_numpy(next_state)
 
         nstep_buf = self._get_nstep_buf(env_id)
-        ready = nstep_buf.add(s_np, action, reward, ns_np, done, tag)
+        ready = nstep_buf.add(s_np, action, reward, ns_np, done, tag, next_mask)
 
-        for s, a, r, ns, d, t in ready:
+        for s, a, r, ns, d, t, m in ready:
             # ✅ clip the n-step return — the sum of n clipped rewards
             # can reach reward_clip * n_step (e.g. 1.0 * 5 = 5.0)
             if self.reward_clip > 0:
@@ -768,13 +809,13 @@ class RainbowAgent:
             # _TAG_PRIORITY_MULT in PrioritizedReplayBuffer.add().
             # The "rank1_tp"/"rank1_sl"/"rank2_tp"/"rank2_sl" tags turn on
             # the right priority multiplier automatically.
-            self.buffer.add(s, a, r, ns, d, t)
+            self.buffer.add(s, a, r, ns, d, t, next_mask=m)
 
             # ── Change 1: elite buffer per rank1/rank2 ───────────────
             # rank1/2 transitions kept apart for the guaranteed
             # sampling (elite_sample_frac of the batch) in train_step().
             if isinstance(t, str) and (t.startswith("rank1") or t.startswith("rank2")):
-                self.elite_buffer.append((s, a, r, ns, d))
+                self.elite_buffer.append((s, a, r, ns, d, self._mask_array(m)))
 
     def train_step(self, freeze_target_steps: int = 0) -> float:
         """
@@ -790,6 +831,7 @@ class RainbowAgent:
         # (no IS correction needed — they're over-represented by design).
         _n_elite = 0
         _elite_states = _elite_actions = _elite_rewards = _elite_ns = _elite_dones = None
+        _elite_masks = None
         if (
             len(self.elite_buffer) >= max(32, int(self.batch_size * self.elite_sample_frac))
             and self.elite_sample_frac > 0
@@ -797,12 +839,13 @@ class RainbowAgent:
             _n_elite = int(self.batch_size * self.elite_sample_frac)
             _elite_idxs = random.sample(range(len(self.elite_buffer)), _n_elite)
             _elite_batch = [self.elite_buffer[i] for i in _elite_idxs]
-            _es, _ea, _er, _ens, _ed = zip(*_elite_batch)
+            _es, _ea, _er, _ens, _ed, _em = zip(*_elite_batch)
             _elite_states = torch.tensor(np.stack(_es), dtype=torch.float32, device=self.device)
             _elite_actions = torch.tensor(np.array(_ea), dtype=torch.long, device=self.device)
             _elite_rewards = torch.tensor(np.array(_er), dtype=torch.float32, device=self.device)
             _elite_ns = torch.tensor(np.stack(_ens), dtype=torch.float32, device=self.device)
             _elite_dones = torch.tensor(np.array(_ed), dtype=torch.float32, device=self.device)
+            _elite_masks = torch.tensor(np.stack(_em), dtype=torch.bool, device=self.device)
 
         # sample the remaining (batch_size - n_elite) from the PER
         _n_per = self.batch_size - _n_elite
@@ -810,7 +853,7 @@ class RainbowAgent:
         if batch is None:
             return 0.0
 
-        states, actions, rewards, next_states, dones, indices, weights = batch
+        states, actions, rewards, next_states, dones, next_masks, indices, weights = batch
 
         # concatenate elite + PER if there are elite samples
         if _n_elite > 0:
@@ -819,6 +862,7 @@ class RainbowAgent:
             rewards = torch.cat([_elite_rewards, rewards], dim=0)
             next_states = torch.cat([_elite_ns, next_states], dim=0)
             dones = torch.cat([_elite_dones, dones], dim=0)
+            next_masks = torch.cat([_elite_masks, next_masks], dim=0)
             # IS weights = 1.0 for the elite transitions (no correction needed)
             _elite_w = torch.ones(_n_elite, dtype=torch.float32, device=self.device)
             weights = torch.cat([_elite_w, weights], dim=0)
@@ -832,6 +876,8 @@ class RainbowAgent:
         with torch.no_grad():
             # the online network picks the best action...
             next_q_online = self.online.q_mean(next_states)  # (B, na)
+            # only the actions available in the next state (HOLD always is)
+            next_q_online = next_q_online.masked_fill(~next_masks, float("-inf"))
             best_actions = next_q_online.argmax(dim=1)  # (B,)
 
             # ...the target network evaluates the distribution of that action
@@ -972,7 +1018,7 @@ class RainbowAgent:
     def save(self, path: str):
         # elite buffer serialized as a list of numpy tuples (portable)
         _elite_list = []
-        for s, a, r, ns, d in self.elite_buffer:
+        for s, a, r, ns, d, m in self.elite_buffer:
             _elite_list.append(
                 (
                     s.numpy() if hasattr(s, "numpy") else np.array(s, dtype=np.float32),
@@ -980,6 +1026,7 @@ class RainbowAgent:
                     float(r),
                     ns.numpy() if hasattr(ns, "numpy") else np.array(ns, dtype=np.float32),
                     bool(d),
+                    np.asarray(m, dtype=bool),
                 )
             )
         torch.save(
@@ -1017,7 +1064,9 @@ class RainbowAgent:
         _elite_list = [] if reset_elite else ckpt.get("elite_buffer", [])
         self.elite_buffer.clear()
         if _elite_list:
-            for s_np, a, r, ns_np, d in _elite_list:
+            for item in _elite_list:
+                s_np, a, r, ns_np, d = item[:5]
+                m = item[5] if len(item) > 5 else None  # agents saved before the masks
                 self.elite_buffer.append(
                     (
                         torch.tensor(s_np, dtype=torch.float32),
@@ -1025,6 +1074,7 @@ class RainbowAgent:
                         r,
                         torch.tensor(ns_np, dtype=torch.float32),
                         d,
+                        self._mask_array(m),
                     )
                 )
         logger.info(

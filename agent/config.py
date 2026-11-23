@@ -117,8 +117,6 @@ DEFAULT_CFG: dict[str, Any] = {
         "rr_mr": 1.0,  # MR RR (breakeven WR = 50%)
         "sl_atr_mult_mr": 1.0,
         "max_bars_mr": 20,  # max 5h for MR
-        "adx_trend_min": 0.25,
-        "adx_ranging_max": 0.35,
         "commission_per_lot": 5.0,
         "pip_size": 0.0001,
         "pip_value": 10.0,  # USD/pip/lot (majors XxxUSD)
@@ -131,7 +129,6 @@ DEFAULT_CFG: dict[str, Any] = {
         "tz_local": "Europe/Rome",
         "device": "cuda",
         "slippage_noise": 0.1,
-        "mask_mode": "explore",
         "hold_reward_warmup_steps": 5000,
         "model_tf_order": ["15min", "30min", "1h", "4h", "1d"],
         # ── Dense reward ─────────────────────────────────────────────────
@@ -154,17 +151,28 @@ DEFAULT_CFG: dict[str, Any] = {
     # ARBITER CFG
     # ══════════════════════════════════════════════════════════════════════
     "arbiter_cfg": {
+        # portfolio quota: binds in eval / live (in training only with train_daily_quota)
         "max_trades_per_day": 5,
-        # w_trend > w_conf: trend acc (62-65%) > regime acc (55-65%)
+        # the agent decides: proposals ranked by their advantage over HOLD, Q(a) - Q(HOLD).
+        # "legacy" = the v26 score (Q + trend / regime / breakout bonuses, w_* below)
+        "score_mode": "advantage",
+        # v26 entry filters: off — the signals they use are already in the agent's state.
+        # When on, the same thresholds apply in training and eval. Their verdict is
+        # computed anyway and the eval "counterfactual" report shows what they'd remove.
+        "entry_filters": False,
+        "tmom_min_eval": 0.20,  # trend: |tmom 30m| and its sign
+        "adx_4h_min": 0.25,  # trend: ADX 4h
+        "di_dir_min": 0.15,  # trend: |DI direction 4h| and its sign
+        "max_regime_uncertainty": 0.65,  # trend: no entries in transition regimes
+        "adx_ranging_max": 0.32,  # MR: ADX 4h below
+        "brk_min_mr": 0.30,  # MR: breakout probability 4h / 30m below
+        "brk_min_eval": 0.35,  # legacy score: breakout penalty
+        # legacy score weights (score_mode="legacy" only)
         "w_q": 1.0,
-        "w_conf": 0.30,  # v26 Run1: less weight on raw confidence
-        "w_trend": 0.55,  # v26 Run1: multi-TF trend/context more informative than the Qs
-        "w_atr": 0.55,  # v26 Run1: penalizes entries in ATR spikes
+        "w_conf": 0.30,
+        "w_trend": 0.55,
+        "w_atr": 0.55,
         "min_score_threshold": -1e9,
-        "max_regime_uncertainty": 0.65,
-        # allowed_regimes=[]: DON'T filter by regime — regime acc 55-60% on
-        # OOD periods isn't reliable enough for a hard gate. The agent learns by itself
-        # when to trade in each regime through the state vector.
         "allowed_regimes": [],
     },
     # ══════════════════════════════════════════════════════════════════════
@@ -221,28 +229,13 @@ DEFAULT_CFG: dict[str, Any] = {
         "health_min_pf": 1.00,
         "health_penalty_dist_all": 0.25,
         "health_max_penalty": 0.60,
-        # directional filters (curriculum: 0.0=OFF, 0.4=Run2, 1.0=Run3)
-        "train_filter_scale": 0.0,  # Run1: OFF — pure exploration, no filter in training
-        "adx_ranging_max": 0.32,
-        "brk_min_mr": 0.30,
-        # TREND bonus in training — balances the MR drift of the Q-network.
-        # Run1: 0.0 (zeroed — the bonus caused forced TREND trades with WR 4% that
-        #           polluted the buffer. The agent learns the difference by itself).
-        # Run2/3: 0.0 (train==eval, Q-network already calibrated).
-        "trend_train_bonus": 0.0,
-        # Rank: max_rank_eval=2 (only rank1+rank2 in eval). Rank curriculum in training.
-        "max_rank_eval": 1,
+        # portfolio daily quota in training: off — an exploring agent would fill it in the
+        # first bars of the day and learn the value of its trades only at 00:00 UTC
+        "train_daily_quota": False,
+        "max_rank_eval": 99,  # cap on the score rank approved per step in eval (99 = off)
         "eval_max_concurrent": 2,  # max 2 open positions in eval (vs 4-5 in training)
-        "rank_qgap_train_r2": 0.000,
-        "rank_qgap_train_r3": 0.000,
-        "rank_qgap_train_r4": 0.000,
-        # joint mode and per-class overrides
         "joint_mode": False,
-        "class_overrides": {
-            "Majors": {"runner_cfg": {"min_q_gap": 0.04}},
-            "Minors": {"runner_cfg": {"min_q_gap": 0.008}},
-        },
-        # safety gates (OFF in Run1, ON in Run2/3)
+        # signal gates (regime mismatch, ATR spike, ping-pong, conf product): filters, off
         "decision_gate": {
             "enabled": False,
             "regime_mismatch_block": True,
@@ -295,6 +288,11 @@ DEFAULT_CFG: dict[str, Any] = {
     },
     "log_every_steps": 5000,  # log the training metrics every N steps
     "seed": 42,
+    # per-class settings, merged over the run's sections (pipeline: class_overrides)
+    "class_overrides": {
+        "Majors": {"runner_cfg": {"min_q_gap": 0.04}},
+        "Minors": {"runner_cfg": {"min_q_gap": 0.008}},
+    },
     "training_mode": "full",  # "full" | "retrain" | "eval"
     "joint_mode": False,
     # ["Minors"] or ["Majors", "Minors"] to run the other classes
@@ -353,12 +351,7 @@ RUN_CONFIGS: dict[str, dict[str, Any]] = {
             "elite_sample_frac": 0.25,
             "elite_buffer_capacity": 20_000,
         },
-        "runner_cfg": {
-            # Run1: light filters, wide DD, explore everything
-            "max_rank_eval": 2,
-            "rank_qgap_train_r3": 0.000,
-            "rank_qgap_train_r4": 0.000,
-        },
+        "runner_cfg": {},
     },
     # ──────────────────────────────────────────────────────────────────────
     # RUN 1 — EXPLORATION MINORS (separate)
@@ -372,11 +365,7 @@ RUN_CONFIGS: dict[str, dict[str, Any]] = {
             "elite_sample_frac": 0.25,
             "elite_buffer_capacity": 20_000,
         },
-        "runner_cfg": {
-            "max_rank_eval": 2,
-            "rank_qgap_train_r3": 0.000,
-            "rank_qgap_train_r4": 0.000,
-        },
+        "runner_cfg": {},
     },
     # ──────────────────────────────────────────────────────────────────────
     # RUN 2 — CONSOLIDATION JOINT (Majors + Minors together)
@@ -392,15 +381,6 @@ RUN_CONFIGS: dict[str, dict[str, Any]] = {
             "elite_buffer_capacity": 20_000,
         },
         "runner_cfg": {
-            # curriculum filters at 40%
-            "train_filter_scale": 0.40,
-            "adx_ranging_max": 0.30,
-            "brk_min_mr": 0.28,
-            "trend_train_bonus": 0.0,  # Run2: off — Q-network already calibrated
-            # rank curriculum: rank3+ need conviction in training
-            "max_rank_eval": 2,
-            "rank_qgap_train_r3": 0.025,
-            "rank_qgap_train_r4": 0.040,
             # tighter DD (more mature agent)
             "max_dd_schedule": [(0.00, 0.32), (0.20, 0.26), (0.55, 0.22), (0.85, 0.18)],
             "daily_dd_schedule": [(0.00, 0.12), (0.20, 0.09), (0.55, 0.07), (0.85, 0.06)],
@@ -424,9 +404,9 @@ RUN_CONFIGS: dict[str, dict[str, Any]] = {
             "health_min_expectancy": 0.0,
             "health_min_pf": 1.03,
             "health_max_penalty": 0.55,
-            # Safety gates ON
+            # signal gates: filters on the agent's decisions, off (entry_filters / report)
             "decision_gate": {
-                "enabled": True,
+                "enabled": False,
                 "regime_mismatch_block": True,
                 "atr_spike_mult": 2.5,
                 "atr_window": 50,
@@ -437,6 +417,10 @@ RUN_CONFIGS: dict[str, dict[str, Any]] = {
             "joint_mode": True,
         },
         "arbiter_cfg": {
+            # MR filter thresholds (used only with entry_filters=True)
+            "adx_ranging_max": 0.30,
+            "brk_min_mr": 0.28,
+            # legacy score weights (score_mode="legacy" only)
             "w_q": 1.0,
             "w_conf": 0.25,
             "w_trend": 0.65,
@@ -459,15 +443,6 @@ RUN_CONFIGS: dict[str, dict[str, Any]] = {
             "elite_buffer_capacity": 20_000,
         },
         "runner_cfg": {
-            # filters at 100% (train==eval)
-            "train_filter_scale": 1.00,
-            "adx_ranging_max": 0.28,
-            "brk_min_mr": 0.25,
-            "trend_train_bonus": 0.0,  # Run3: off — train==eval
-            # full rank curriculum
-            "max_rank_eval": 2,
-            "rank_qgap_train_r3": 0.040,
-            "rank_qgap_train_r4": 0.060,
             # live-like DD
             "max_dd_schedule": [(0.00, 0.18), (0.25, 0.14), (0.60, 0.10), (0.85, 0.08)],
             "daily_dd_schedule": [(0.00, 0.07), (0.25, 0.05), (0.60, 0.04), (0.85, 0.035)],
@@ -491,9 +466,9 @@ RUN_CONFIGS: dict[str, dict[str, Any]] = {
             "health_min_expectancy": 0.0,
             "health_min_pf": 1.05,
             "health_max_penalty": 0.60,
-            # every safety gate ON
+            # signal gates: filters on the agent's decisions, off (entry_filters / report)
             "decision_gate": {
-                "enabled": True,
+                "enabled": False,
                 "regime_mismatch_block": True,
                 "atr_spike_mult": 2.5,
                 "atr_window": 50,
@@ -513,6 +488,10 @@ RUN_CONFIGS: dict[str, dict[str, Any]] = {
             "joint_mode": True,
         },
         "arbiter_cfg": {
+            # MR filter thresholds (used only with entry_filters=True)
+            "adx_ranging_max": 0.28,
+            "brk_min_mr": 0.25,
+            # legacy score weights (score_mode="legacy" only)
             "w_q": 1.0,
             "w_conf": 0.20,
             "w_trend": 0.70,

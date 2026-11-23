@@ -37,6 +37,7 @@ from encoder.dataset import _load_all_scalers_file
 
 from .arbiter import MultiAssetRunner, TradeArbiter
 from .config import DATA_ROOT, DEFAULT_CFG, MODELS_ROOT, RUN_CONFIGS, build_cfg
+from .diagnostics import counterfactual_report
 from .env import (
     MarketEnv,
     encoder_asset_id,
@@ -255,6 +256,28 @@ def aggregate_class_metrics(asset_summaries: dict[str, dict[str, Any]]) -> dict[
         "avg_rr": float(avg_rr),
         "avg_trades_per_asset": float(avg_trades_per_asset),
     }
+
+
+def _asset_summaries(envs: dict, initial_capital: float) -> dict[str, dict]:
+    """Trade summary of every env with pnl, expectancy and return / max DD."""
+    out = {}
+    for asset, env in envs.items():
+        s = env.render_last_trade_summary()
+        s["pnl"] = float(s.get("sum_profit", 0.0) - s.get("sum_loss", 0.0))
+        wins = int(s.get("wins", 0))
+        losses = int(s.get("losses", 0))
+        trades = int(s.get("trades", 0))
+        avg_win = (s.get("sum_profit", 0.0) / wins) if wins > 0 else 0.0
+        avg_loss = (s.get("sum_loss", 0.0) / losses) if losses > 0 else 0.0
+        win_rate = s.get("win_rate", 0.0)
+        loss_rate = (losses / trades) if trades > 0 else 0.0
+        expectancy = (win_rate * avg_win) - (loss_rate * avg_loss)
+        capital = float(s.get("initial_capital", initial_capital))
+        max_dd = float(s.get("max_dd_static", s.get("drawdown", 0.0)))
+        r_over_dd = s["pnl"] / (capital * max_dd) if max_dd > 0 else 0.0
+        s.update({"expectancy": float(expectancy), "return_over_max_dd": float(r_over_dd)})
+        out[asset] = s
+    return out
 
 
 def compute_global_metrics(
@@ -500,11 +523,13 @@ def _rainbow_train_loop(
                 done,
                 tag=tag,
                 env_id=asset,
+                next_mask=tr.get("next_mask"),
             )
             # Q-gap: difference between the best and the worst Q (conviction)
             prop = tr.get("proposal")
             if prop is not None and getattr(prop, "q_vals_masked", None) is not None:
                 qv = np.array(prop.q_vals_masked, dtype=np.float32)
+                qv = qv[qv > -1e8]  # the available actions only
                 if len(qv) >= 2:
                     _q_gaps.append(float(np.max(qv) - np.min(qv)))
 
@@ -553,23 +578,10 @@ def _rainbow_train_loop(
         agent = agents[asset_class_map[asset]]
         nsbuf = agent._nstep_bufs.get(asset)
         if nsbuf and len(nsbuf._buf) > 0:
-            buf_list = list(nsbuf._buf)
-            for i in range(len(buf_list)):
-                s_i, a_i, _, _, _, tag_i = buf_list[i]
-                R = 0.0
-                actual_ns = buf_list[-1][3]
-                actual_done = True
-                for j, (_, _, r_j, ns_j, d_j, _) in enumerate(buf_list[i:]):
-                    R += (agent.gamma**j) * r_j
-                    actual_ns = ns_j
-                    actual_done = d_j
-                    if d_j:
-                        break
-                agent.buffer.add(s_i, a_i, R, actual_ns, actual_done, tag_i)
-            nsbuf.reset()
-            logger.info(
-                "[NSTEP] flushed %d leftover transitions for asset %s", len(buf_list), asset
-            )
+            ready = nsbuf.flush()
+            for s_i, a_i, R, ns_i, d_i, tag_i, m_i in ready:
+                agent.buffer.add(s_i, a_i, R, ns_i, d_i, tag_i, next_mask=m_i)
+            logger.info("[NSTEP] flushed %d leftover transitions for asset %s", len(ready), asset)
 
     return runner
 
@@ -1055,23 +1067,7 @@ def run_walk_forward_for_asset_map(
             pbar_eval.close()
 
         # Metrics
-        asset_summaries = {}
-        for asset, env in test_envs.items():
-            s = env.render_last_trade_summary()
-            s["pnl"] = float(s.get("sum_profit", 0.0) - s.get("sum_loss", 0.0))
-            wins = int(s.get("wins", 0))
-            losses = int(s.get("losses", 0))
-            trades = int(s.get("trades", 0))
-            avg_win = (s.get("sum_profit", 0.0) / wins) if wins > 0 else 0.0
-            avg_loss = (s.get("sum_loss", 0.0) / losses) if losses > 0 else 0.0
-            win_rate = s.get("win_rate", 0.0)
-            loss_rate = (losses / trades) if trades > 0 else 0.0
-            expectancy = (win_rate * avg_win) - (loss_rate * avg_loss)
-            initial_capital = float(s.get("initial_capital", cfg.get("initial_capital", 100000.0)))
-            max_dd = float(s.get("max_dd_static", s.get("drawdown", 0.0)))
-            r_over_dd = s["pnl"] / (initial_capital * max_dd) if max_dd > 0 else 0.0
-            s.update({"expectancy": float(expectancy), "return_over_max_dd": float(r_over_dd)})
-            asset_summaries[asset] = s
+        asset_summaries = _asset_summaries(test_envs, float(cfg.get("initial_capital", 100000.0)))
 
         class_summary = aggregate_class_metrics(asset_summaries)
         global_summary = compute_global_metrics(
@@ -1152,6 +1148,8 @@ def run_walk_forward_for_asset_map(
             "meta": meta,
             "arbiter_stats_train": runner.arbiter_stats if runner else {},
             "arbiter_stats_eval": eval_runner.arbiter_stats,
+            # the agent's trade decisions replayed: what the filters and limits removed
+            "counterfactual": counterfactual_report(eval_runner),
             "runner_diagnostics": {
                 "qgap_filtered": int(eval_runner.arbiter_stats.get("qgap_filtered", 0)),
                 "vote_blocked": int(eval_runner.arbiter_stats.get("vote_blocked", 0)),
@@ -1268,6 +1266,7 @@ def run_walk_forward_for_asset_map(
                         "agent_type": "rainbow",
                     },
                     "arbiter_stats_val": val_runner.arbiter_stats,
+                    "counterfactual": counterfactual_report(val_runner),
                 }
                 val_json = os.path.join(wf_dir, f"val_summary_{wf_name}.json")
                 with open(val_json, "w") as f:
@@ -1639,7 +1638,77 @@ def run_walk_forward_joint(
             wf_idx + 1,
         )
 
-        results_all[wf_name] = {"wf_idx": wf_idx, "assets": list(all_train_envs.keys())}
+        # ============ EVAL: out of sample, shared portfolio ============
+        eval_runner_cfg = runner_cfg.copy()
+        _sl_map = runner_cfg.get("eval_max_daily_losses_by_wf", {})
+        eval_runner_cfg["max_daily_losses"] = int(
+            _sl_map.get(enc_key, runner_cfg.get("max_daily_losses", 3))
+        )
+        eval_runner_cfg["mode"] = "eval"
+        eval_runner_cfg["baseline_max_dd"] = runner_cfg.get("eval_max_dd", 0.045)
+        eval_runner_cfg["baseline_daily_dd"] = runner_cfg.get("eval_daily_dd_limit", 0.025)
+        for env in all_test_envs.values():
+            env.max_dd = float(eval_runner_cfg["baseline_max_dd"])
+            env.daily_dd_limit = float(eval_runner_cfg["baseline_daily_dd"])
+            env.training_mode = "eval"
+        agent.set_eval_mode()
+        arbiter_eval = TradeArbiter(arbiter_cfg)
+        arbiter_eval._max_rank_eval = int(runner_cfg.get("max_rank_eval", 99))
+        pbar_eval = tqdm(
+            total=max(len(env.df) for env in all_test_envs.values()),
+            desc=f"Joint WF{wf_idx} eval",
+            unit="step",
+        )
+        try:
+            eval_runner = _eval_loop(
+                all_test_envs, agents, asset_class_map, arbiter_eval, eval_runner_cfg, pbar_eval
+            )
+        finally:
+            pbar_eval.close()
+        asset_summaries = _asset_summaries(
+            all_test_envs, float(cfg.get("initial_capital", 100000.0))
+        )
+        global_summary = compute_global_metrics(
+            asset_summaries, eval_runner.portfolio, test_start, test_end, all_test_envs
+        )
+        eval_summary = {
+            "assets": asset_summaries,
+            "classes": {
+                c: aggregate_class_metrics(
+                    {a: s for a, s in asset_summaries.items() if asset_class_map.get(a) == c}
+                )
+                for c in ("Majors", "Minors")
+            },
+            "global": global_summary,
+            "meta": {
+                "wf_id": int(wf_idx),
+                "wf_name": wf_name,
+                "train_period": [str(train_start.date()), str(train_end.date())],
+                "test_period": [str(test_start.date()), str(test_end.date())],
+                "tz": "UTC",
+                "agent_type": "rainbow",
+                "joint": True,
+            },
+            "arbiter_stats_eval": eval_runner.arbiter_stats,
+            "counterfactual": counterfactual_report(eval_runner),
+        }
+        eval_json_path = os.path.join(wf_dir, f"eval_summary_{wf_name}.json")
+        with open(eval_json_path, "w") as f:
+            json.dump(eval_summary, f, indent=2, default=str)
+        logger.info(
+            "[JOINT EVAL] WR=%.1f%%  PF=%.3f  PnL=%+.0f  trades=%d → %s",
+            global_summary.get("win_rate", 0.0) * 100,
+            global_summary.get("profit_factor", 0.0),
+            global_summary.get("pnl", 0.0),
+            global_summary.get("total_trades", 0),
+            eval_json_path,
+        )
+
+        results_all[wf_name] = {
+            "wf_idx": wf_idx,
+            "assets": list(all_train_envs.keys()),
+            "eval_summary": eval_json_path,
+        }
 
     return results_all
 

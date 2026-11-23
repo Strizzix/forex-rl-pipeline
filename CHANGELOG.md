@@ -20,7 +20,27 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   with the strategy head (`python -m agent.strategy_head`); agents trained before must be
   trained again. **(AI-assisted)**
 
+- `agent`: the arbiter no longer second-guesses the agent. Trades are ranked by the agent's
+  advantage over HOLD, Q(a) − Q(HOLD), instead of a score where the trend / breakout bonuses
+  (±0.5) outweighed the Q differences (±0.02) and the "confidence" was the embedding norm (a
+  constant after the LayerNorm); the v26 entry filters and decision gates are off. Both stay
+  available (`score_mode: "legacy"`, `entry_filters: true`), with the same thresholds in
+  training and eval. **(AI-assisted)**
+- `agent`: what can't be done is an action mask, in training too: position open, entry
+  lockouts, the day's trades, daily DD budget and the portfolio limits (position slots, daily
+  gate, DD block, kill switch). Before, the trades the arbiter rejected were stored as HOLD:
+  in a synthetic Run1 the global 5-trades-a-day quota turned 98% of the agent's trade choices
+  into HOLD and 85% of the trades it did learn from opened at 00:00 UTC, right after the quota
+  reset (now: 94% executed, opens spread over the day). The portfolio quota binds in eval only
+  (`train_daily_quota`). The replay stores the next state's mask and the Double DQN target
+  picks among the available actions only. **(AI-assisted)**
+
 ### Added
+- `agent/diagnostics.py`: `counterfactual` report in every eval / val summary — each trade the
+  agent wanted, replayed with the env rules (mean R, win rate) per stage that stopped it and
+  per entry-filter verdict, computed also with the filters off. **(AI-assisted)**
+- `agent`: the joint runs (Run2 / Run3) evaluate every WF out of sample on the shared
+  portfolio and save `eval_summary_<wf>.json`; before they only trained. **(AI-assisted)**
 - `agent/strategy_head.py`: the agent's `StrategyOutcomeHead` (P(hit) and P(TP first) of TREND /
   MR x LONG / SHORT) trained on top of each frozen encoder checkpoint, with labels made by the
   env's own trade rules, on the checkpoint's training window (early stopping on its validation
@@ -97,6 +117,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   **(AI-assisted)**
 
 ### Fixed
+- `agent`: settings that never reached the code: `train_filter_scale`, `adx_ranging_max`,
+  `brk_min_mr` and `trend_train_bonus` were in `runner_cfg` but read from `arbiter_cfg` (the
+  "filters at 40% / 100% in training" of Run2 / Run3 never applied: training was always
+  unfiltered, eval always filtered); `class_overrides` was inside `runner_cfg` but read at the
+  top level (the per-class `min_q_gap` 0.04 / 0.008 was never used); `eval_max_concurrent` only
+  scaled a state feature, the eval cap was the training one; the per-rank Q-gap curriculum was
+  never read. Moved, applied or removed. **(AI-assisted)**
+- `agent`: the eval vote masked only actions 1-2, so a masked MR action could win a vote.
+  **(AI-assisted)**
 - `agent`: the env read the encoder differently from how it was trained — its own copy of the
   encoder, heads rebuilt from the `state_dict` shapes (trend without `tanh * 3`, DI direction
   through `softplus`, so never negative: DI gates and bonuses broken), columns in parquet order

@@ -21,6 +21,7 @@ PORTFOLIO:
   - blocks on both
 """
 
+import dataclasses
 import logging
 from collections import deque
 from dataclasses import dataclass
@@ -101,66 +102,75 @@ class TradeProposal:
     rollout_step: Optional[any] = None
     is_ppo: bool = False
     strategy_type: str = "trend"  # v26: "trend" | "mr"
+    # advantage score and diagnostics
+    q_hold: Optional[float] = None  # Q(HOLD) of the same state
+    filter_check: Optional[str] = None  # entry-filter verdict, also with the filters off
+    reject_stage: Optional[str] = None  # where a trade proposal was stopped, if it was
+    shadow_action: int = 0  # eval: the agent's trade choice its conviction filters stopped
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TradeArbiter  (scoring + selection)
 # ══════════════════════════════════════════════════════════════════════════════
 class TradeArbiter:
-    """Picks the best TradeProposals by score, within the daily quota."""
+    """
+    Ranks the agent's trade proposals and keeps the best ones within the daily quota.
+
+    By default it doesn't second-guess the agent: the score is the agent's own advantage
+    over HOLD, Q(action) - Q(HOLD), and no entry filter is applied — the trend / regime /
+    breakout signals the filters use are already in the agent's state.
+
+    Options (arbiter_cfg):
+      score_mode     "advantage" (default) | "legacy": the v26 score, Q plus trend / regime /
+                     breakout / strategy-outcome bonuses and an ATR and time penalty
+      entry_filters  False (default) | True: the v26 entry filters (trend: tmom / ADX 4h /
+                     DI 4h agreeing with the direction, regime uncertainty; MR: low ADX and
+                     breakout probability; time to the force close), with the SAME thresholds
+                     in training and eval
+    The filter verdict is always computed (proposal.filter_check), also with the filters
+    off, so the eval report can show what the filters would have removed.
+    """
 
     def __init__(self, cfg: dict[str, Any]):
         self.cfg = cfg
         self._arbiter_cfg = cfg  # alias for property access
-        self.w_q = cfg.get("w_q", 1.0)
-        self.w_conf = cfg.get("w_conf", 0.5)
-        self.w_trend = cfg.get("w_trend", 0.4)  # ↑ was 0.2 (scalar tmom more informative)
-        self.w_atr = cfg.get("w_atr", 0.5)
-        # v26: StrategyOutcomeHead weights — 0.0 in Run1, enabled in Run2+
-        self.w_outcome = float(cfg.get("w_outcome", 0.0))
-        self.w_strategy_edge = float(cfg.get("w_strategy_edge", 0.0))
+        self.score_mode = str(cfg.get("score_mode", "advantage"))
+        if self.score_mode not in ("advantage", "legacy"):
+            raise ValueError(f"score_mode must be 'advantage' or 'legacy', got {self.score_mode}")
+        self.entry_filters = bool(cfg.get("entry_filters", False))
         self.max_trades_per_day = int(cfg.get("max_trades_per_day", 5))
         self.min_score_threshold = cfg.get("min_score_threshold", -1e9)
-        # Entry filters (eval/live only) — v25
-        self.tmom_min_eval = float(
-            cfg.get("tmom_min_eval", 0.20)
-        )  # Run1: 0.20 (→0.25→0.30 in Run2/3)
-        self.adx_min_eval = float(
-            cfg.get("adx_min_eval", 0.0)
-        )  # legacy: 30m ADX gate (default off)
-        self.adx_4h_min = float(cfg.get("adx_4h_min", 0.25))  # Run1: 0.25 (→0.30→0.35 in Run2/3)
-        # v25: di_direction filter (corr ~0.95) — second directional gate
-        self.di_dir_min = float(cfg.get("di_dir_min", 0.15))  # Run1: 0.15 (→0.20→0.25 in Run2/3)
-        # v25: breakout probability threshold — penalty if 4h brk_prob < this in score
-        self.brk_min_eval = float(
-            cfg.get("brk_min_eval", 0.35)
-        )  # Run1: 0.35 (→0.40→0.45 in Run2/3)
-        self.tmom_multi_tf = bool(
-            cfg.get("tmom_multi_tf", True)
-        )  # 30m+1h confirmation bonus in score
-        # v26: MR regime thresholds (inverse of trend thresholds)
+        # legacy score weights
+        self.w_q = cfg.get("w_q", 1.0)
+        self.w_conf = cfg.get("w_conf", 0.5)
+        self.w_trend = cfg.get("w_trend", 0.4)
+        self.w_atr = cfg.get("w_atr", 0.5)
+        self.w_outcome = float(cfg.get("w_outcome", 0.0))
+        self.w_strategy_edge = float(cfg.get("w_strategy_edge", 0.0))
+        self.tmom_multi_tf = bool(cfg.get("tmom_multi_tf", True))
+        # entry filter thresholds (also used by the filter verdict when the filters are off)
+        self.tmom_min_eval = float(cfg.get("tmom_min_eval", 0.20))
+        self.adx_min_eval = float(cfg.get("adx_min_eval", 0.0))  # legacy 30m ADX gate, off
+        self.adx_4h_min = float(cfg.get("adx_4h_min", 0.25))
+        self.di_dir_min = float(cfg.get("di_dir_min", 0.15))
+        self.brk_min_eval = float(cfg.get("brk_min_eval", 0.35))
         self.adx_ranging_max = float(cfg.get("adx_ranging_max", 0.28))
         self.brk_min_mr = float(cfg.get("brk_min_mr", 0.35))
-
-        # ── Curriculum filter scale for training (v25) ──────────────────
-        # Run 1 (Exploration): train_filter_scale=0.0 -> train without filters
-        # Run 2 (Consolidation): train_filter_scale=0.4 -> thresholds at 40% of eval
-        # Run 3 (Production):    train_filter_scale=1.0 -> train==eval
-        # Lets the agent get used to the filters gradually.
-        self.train_filter_scale = float(cfg.get("train_filter_scale", 0.0))
+        self._max_rank_eval = 99
 
         if cfg.get("allowed_regimes"):
             logger.warning("allowed_regimes configured but regime hard-filter is disabled.")
 
+    # ── score ─────────────────────────────────────────────────────────────────
     def score(self, p: TradeProposal) -> float:
-        """Rainbow score: Q-value + tmom alignment - ATR penalty.
+        """Advantage over HOLD (default), or the v26 score with score_mode="legacy"."""
+        if self.score_mode == "legacy":
+            return self._legacy_score(p)
+        q_hold = p.q_hold if p.q_hold is not None else 0.0
+        return float(p.q_value - q_hold)
 
-        Trend score: tmom_30m scalar normalized to [-1, 1].
-          LONG:  positive tmom = aligned (bonus), negative = counter-trend (malus)
-          SHORT: the other way round.
-        Multi-TF confirmation: if 30m and 1h agree, +0.15.
-        The DQN decides the direction — the arbiter picks the trades most aligned with the trend.
-        """
+    def _legacy_score(self, p: TradeProposal) -> float:
+        """v26 score: Q-value + tmom alignment and encoder bonuses - ATR / time penalties."""
         base = self.w_q * p.q_value + self.w_conf * p.confidence - self.w_atr * p.atr
 
         tmom = p.tmom_30m if p.tmom_30m is not None else p.trend_alignment
@@ -177,8 +187,7 @@ class TradeArbiter:
             elif p.action == 2 and tmom < 0 and p.tmom_1h < 0:
                 trend_score += 0.15
 
-        # v25: di_direction_4h bonus — if it agrees with tmom 30m, +0.10
-        # stable signal (corr 0.95), multi-period alignment
+        # di_direction_4h agreeing with tmom 30m -> +0.10
         if p.di_dir_4h is not None and p.action != 0:
             di_4h = p.di_dir_4h
             if p.action == 1 and tmom > 0 and di_4h > 0.2:
@@ -186,244 +195,176 @@ class TradeArbiter:
             elif p.action == 2 and tmom < 0 and di_4h < -0.2:
                 trend_score += 0.10
 
-        # v26+: di_direction_1h triple-TF alignment bonus — +0.08 when 30m+1h+4h agree
-        # di_dir_1h corr=0.942±0.006 — the most stable signal after 4h
-        # bonus smaller than 4h (+0.10) to avoid double counting with 4h
-        if p.di_dir_1h is not None and p.action not in (0, 3, 4):  # TREND only
+        # di_direction_1h triple-TF alignment -> +0.08 (TREND only)
+        if p.di_dir_1h is not None and p.action not in (0, 3, 4):
             di_1h = p.di_dir_1h
             if p.action == 1 and tmom > 0 and di_1h > 0.15:
                 trend_score += 0.08
             elif p.action == 2 and tmom < 0 and di_1h < -0.15:
                 trend_score += 0.08
 
-        # v25: breakout probability soft penalty
-        # if brk_prob_4h < brk_min_eval the market is probably RANGING -> penalize trend trades
-        # Penalty proportional to the gap, max -0.30 at brk_prob=0.10
+        # breakout probability soft penalty (probably RANGING), max -0.30
         brk_4h = p.brk_prob_4h
         brk_penalty = 0.0
         if brk_4h is not None and self.brk_min_eval > 0 and brk_4h < self.brk_min_eval:
             brk_penalty = float(np.clip((self.brk_min_eval - brk_4h), 0.0, 0.30))
 
-        # v26+: MR soft bonus — with brk_30m low the market is deep-ranging -> MR favoured
-        # brk_30m is the most stable signal (std=0.003), a good RANGING proxy
-        # proportional bonus: brk_30m=0.10 (+0.08), brk_30m=brk_min_mr (0.0)
+        # MR bonus in a deep-ranging market (low brk_30m), max +0.08
         mr_ranging_bonus = 0.0
         if p.action in (3, 4) and p.brk_prob_30m is not None and self.brk_min_mr > 0:
             gap = float(np.clip(self.brk_min_mr - p.brk_prob_30m, 0.0, self.brk_min_mr))
-            mr_ranging_bonus = 0.08 * (gap / self.brk_min_mr)  # max +0.08 a brk_30m=0
+            mr_ranging_bonus = 0.08 * (gap / self.brk_min_mr)
 
-        # v26: StrategyOutcomeHead bonus (only if w_outcome > 0)
+        # StrategyOutcomeHead bonus (only if w_outcome / w_strategy_edge > 0)
         outcome_bonus = 0.0
         if self.w_outcome > 0 and p.proposal_tp_prob is not None:
             outcome_bonus += self.w_outcome * (p.proposal_tp_prob - 0.25)
         if self.w_strategy_edge > 0 and p.strategy_edge is not None:
             outcome_bonus += self.w_strategy_edge * p.strategy_edge
 
-        # v26: SOH direction alignment bonus — on even with w_outcome=0
-        # Uses only the relative ORDER of the combos (not the absolute P(TP) values).
-        # Doesn't need calibrated P(TP): works with a partial context too.
-        # If SOH agrees with the chosen direction -> +0.05, if it contradicts it -> -0.05
-        # Minimum gap 0.03, so no bonus/malus on nearly identical values.
-        _soh_align_bonus = 0.0
-        _SOH_GAP_THR = 0.03  # minimum P(TP) gap between the two directions to apply
-        _SOH_ALIGN_W = 0.05  # symmetric bonus/malus
-        if p.action in (1, 2):  # TREND LONG or SHORT
-            _p_tl = p.p_tp_trend_long
-            _p_ts = p.p_tp_trend_short
-            if _p_tl is not None and _p_ts is not None:
-                _gap = _p_tl - _p_ts
-                if p.action == 1 and _gap > _SOH_GAP_THR:  # LONG, SOH says LONG is better
-                    _soh_align_bonus = _SOH_ALIGN_W
-                elif p.action == 1 and _gap < -_SOH_GAP_THR:  # LONG, SOH says SHORT is better
-                    _soh_align_bonus = -_SOH_ALIGN_W
-                elif p.action == 2 and _gap < -_SOH_GAP_THR:  # SHORT, SOH says SHORT is better
-                    _soh_align_bonus = _SOH_ALIGN_W
-                elif p.action == 2 and _gap > _SOH_GAP_THR:  # SHORT, SOH says LONG is better
-                    _soh_align_bonus = -_SOH_ALIGN_W
-        elif p.action in (3, 4):  # MR LONG or SHORT
-            _p_ml = p.p_tp_mr_long
-            _p_ms = p.p_tp_mr_short
-            if _p_ml is not None and _p_ms is not None:
-                _gap = _p_ml - _p_ms
-                if p.action == 3 and _gap > _SOH_GAP_THR:  # MR LONG, SOH agrees
-                    _soh_align_bonus = _SOH_ALIGN_W
-                elif p.action == 3 and _gap < -_SOH_GAP_THR:
-                    _soh_align_bonus = -_SOH_ALIGN_W
-                elif p.action == 4 and _gap < -_SOH_GAP_THR:  # MR SHORT, SOH agrees
-                    _soh_align_bonus = _SOH_ALIGN_W
-                elif p.action == 4 and _gap > _SOH_GAP_THR:
-                    _soh_align_bonus = -_SOH_ALIGN_W
-        outcome_bonus += _soh_align_bonus
+        # StrategyOutcomeHead direction agreement: +/-0.05 when the P(TP) gap > 0.03
+        pairs = {
+            1: ("p_tp_trend_long", "p_tp_trend_short", 1),
+            2: ("p_tp_trend_long", "p_tp_trend_short", -1),
+        }
+        pairs.update(
+            {3: ("p_tp_mr_long", "p_tp_mr_short", 1), 4: ("p_tp_mr_long", "p_tp_mr_short", -1)}
+        )
+        if p.action in pairs:
+            long_k, short_k, sign = pairs[p.action]
+            p_long, p_short = getattr(p, long_k), getattr(p, short_k)
+            if p_long is not None and p_short is not None:
+                gap = sign * (p_long - p_short)
+                if gap > 0.03:
+                    outcome_bonus += 0.05
+                elif gap < -0.03:
+                    outcome_bonus -= 0.05
 
-        # v26: session-time penalty — TREND trades too close to the force close
-        # get a malus proportional to the missing time.
-        # Soft penalty (Run1/2): the score is penalized but the trade isn't blocked.
-        # Hard block (Run2/3): through passes_entry_filter with trend_min_bars_to_close.
+        # TREND trades close to the force close: malus, doubled below the hard threshold
         time_penalty = 0.0
         bars_fc = getattr(p, "bars_to_force_close", None)
-        if bars_fc is not None and p.action in (1, 2):  # TREND only
-            _bars_threshold_soft = float(self._arbiter_cfg.get("trend_soft_close_bars", 24))
-            _bars_threshold_hard = float(self._arbiter_cfg.get("trend_hard_close_bars", 12))
-            _w_time = float(self._arbiter_cfg.get("w_time_penalty", 0.20))
-            if bars_fc < _bars_threshold_soft:
-                frac = 1.0 - (bars_fc / _bars_threshold_soft)
-                time_penalty = _w_time * frac
-                if bars_fc < _bars_threshold_hard:
-                    time_penalty *= 2.0  # double penalty below the hard threshold
+        if bars_fc is not None and p.action in (1, 2):
+            soft = float(self._arbiter_cfg.get("trend_soft_close_bars", 24))
+            hard = float(self._arbiter_cfg.get("trend_hard_close_bars", 12))
+            w_time = float(self._arbiter_cfg.get("w_time_penalty", 0.20))
+            if bars_fc < soft:
+                time_penalty = w_time * (1.0 - bars_fc / soft)
+                if bars_fc < hard:
+                    time_penalty *= 2.0
 
-        # v26+: TREND diversity bonus in training
-        # The Q-network tends to prefer MR -> TREND gets picked rarely.
-        # A fixed bonus balances the MR drift without distorting the reward.
-        # Training only. Off in eval (MR is already blocked by the gates).
-        _trend_train_bonus = 0.0
-        _mode_local = getattr(self, "_current_mode", "train")
-        if _mode_local == "train" and p.action in (1, 2):
-            _trend_train_bonus = float(self._arbiter_cfg.get("trend_train_bonus", 0.12))
+        # TREND bonus in training (balances the MR drift), off in eval
+        trend_train_bonus = 0.0
+        if getattr(self, "_current_mode", "train") == "train" and p.action in (1, 2):
+            trend_train_bonus = float(self._arbiter_cfg.get("trend_train_bonus", 0.0))
 
         return (
             base
             + self.w_trend * trend_score
             - brk_penalty
-            + _trend_train_bonus
+            + trend_train_bonus
             + mr_ranging_bonus
             + outcome_bonus
             - time_penalty
         )
 
+    # ── entry filters ─────────────────────────────────────────────────────────
     def passes_entry_filter(self, p: TradeProposal, mode: str = "train") -> bool:
-        """True if the proposal passes every entry filter (see entry_filter_reason)."""
+        """True if the proposal passes the entry filters (always, with the filters off)."""
         return self.entry_filter_reason(p, mode) == "pass"
 
     def entry_filter_reason(self, p: TradeProposal, mode: str = "train") -> str:
+        """ "pass", "hold", or the first filter that failed (only with entry_filters on)."""
+        if p.action == 0:
+            return "hold"
+        if not self.entry_filters:
+            return "pass"
+        return self.filter_check(p)
+
+    def filter_check(self, p: TradeProposal) -> str:
         """
-        Returns "pass", or the reason of the first filter that failed.
+        Verdict of the entry filters, whether they're on or not: "pass", "hold", or the
+        reason of the first filter that fails. Same thresholds in training and eval.
         """
         if p.action == 0:
             return "hold"
-
+        cfg = self._arbiter_cfg
         is_trend = p.action in (1, 2)
-        is_mr = p.action in (3, 4)
 
-        if mode == "eval" and p.bars_to_force_close is not None:
-            if is_trend:
-                min_bars = int(self._arbiter_cfg.get("trend_min_bars_to_close", 0))
-                if min_bars > 0 and p.bars_to_force_close < min_bars:
-                    return "trend_time_lockout"
-            elif is_mr:
-                min_bars_mr = int(self._arbiter_cfg.get("mr_min_bars_to_close", 0))
-                if min_bars_mr > 0 and p.bars_to_force_close < min_bars_mr:
-                    return "mr_time_lockout"
+        if p.bars_to_force_close is not None:
+            key = "trend_min_bars_to_close" if is_trend else "mr_min_bars_to_close"
+            min_bars = int(cfg.get(key, 0))
+            if min_bars > 0 and p.bars_to_force_close < min_bars:
+                return "trend_time_lockout" if is_trend else "mr_time_lockout"
 
-        if mode == "eval" and is_trend:
-            max_unc = float(self._arbiter_cfg.get("max_regime_uncertainty", 0.72))
-            if p.regime_uncertainty is not None and p.regime_uncertainty > max_unc:
-                return "regime_uncertainty"
-
-        if is_mr:
-            adx_4h_v = p.adx_4h if p.adx_4h is not None else 1.0
-            brk_4h_v = p.brk_prob_4h if p.brk_prob_4h is not None else 1.0
-            brk_30m_v = p.brk_prob_30m if p.brk_prob_30m is not None else 1.0
-
-            if mode == "train":
-                scale = self.train_filter_scale
-                if scale <= 0.0:
-                    return "pass"
-                adx_limit = self.adx_ranging_max * (1.0 + scale)
-                brk_limit = self.brk_min_mr * (1.0 + scale)
-                if adx_4h_v >= adx_limit:
-                    return "mr_adx_too_high_train"
-                if brk_4h_v >= brk_limit:
-                    return "mr_brk_4h_too_high_train"
-                if brk_30m_v >= brk_limit:
-                    return "mr_brk_30m_too_high_train"
-                return "pass"
-
-            if adx_4h_v >= self.adx_ranging_max:
+        if not is_trend:  # MR: only in a ranging market
+            if (p.adx_4h if p.adx_4h is not None else 1.0) >= self.adx_ranging_max:
                 return "mr_adx_too_high"
-            if brk_4h_v >= self.brk_min_mr:
+            if (p.brk_prob_4h if p.brk_prob_4h is not None else 1.0) >= self.brk_min_mr:
                 return "mr_brk_4h_too_high"
-            if brk_30m_v >= self.brk_min_mr:
+            if (p.brk_prob_30m if p.brk_prob_30m is not None else 1.0) >= self.brk_min_mr:
                 return "mr_brk_30m_too_high"
             return "pass"
 
+        max_unc = float(cfg.get("max_regime_uncertainty", 0.72))
+        if p.regime_uncertainty is not None and p.regime_uncertainty > max_unc:
+            return "regime_uncertainty"
         tmom = p.tmom_30m if p.tmom_30m is not None else 0.0
         adx_30m_v = p.adx_30m if p.adx_30m is not None else 1.0
         adx_4h_v = p.adx_4h if p.adx_4h is not None else 1.0
         di_4h = p.di_dir_4h if p.di_dir_4h is not None else 0.0
-
-        if mode == "train":
-            scale = self.train_filter_scale
-            if scale <= 0.0:
-                return "pass"
-            tmom_min = self.tmom_min_eval * scale
-            adx_4h_min = self.adx_4h_min * scale
-            di_min = self.di_dir_min * scale
-            adx_legacy = self.adx_min_eval * scale
-        else:
-            tmom_min = self.tmom_min_eval
-            adx_4h_min = self.adx_4h_min
-            di_min = self.di_dir_min
-            adx_legacy = self.adx_min_eval
-
-        if adx_4h_min > 0 and adx_4h_v < adx_4h_min:
+        if self.adx_4h_min > 0 and adx_4h_v < self.adx_4h_min:
             return "trend_adx_4h_too_low"
-        if adx_legacy > 0 and adx_30m_v < adx_legacy:
+        if self.adx_min_eval > 0 and adx_30m_v < self.adx_min_eval:
             return "trend_adx_30m_too_low"
-        if abs(tmom) < tmom_min:
+        if abs(tmom) < self.tmom_min_eval:
             return "trend_tmom_too_low"
         if p.action == 1 and tmom < 0:
             return "trend_long_wrong_sign"
         if p.action == 2 and tmom > 0:
             return "trend_short_wrong_sign"
-        if di_min > 0:
-            if abs(di_4h) < di_min:
+        if self.di_dir_min > 0:
+            if abs(di_4h) < self.di_dir_min:
                 return "trend_di_too_low"
             if p.action == 1 and di_4h < 0:
                 return "trend_long_di_wrong_sign"
             if p.action == 2 and di_4h > 0:
                 return "trend_short_di_wrong_sign"
-
         return "pass"
 
+    # ── selection ─────────────────────────────────────────────────────────────
     def select(
         self,
         proposals: list[TradeProposal],
         remaining_trades: int,
     ) -> dict[str, TradeProposal]:
+        """Approves the best-scored trade proposals, at most remaining_trades of them."""
         mode = getattr(self, "_current_mode", "train")
         candidates = []
         for p in proposals:
             if p.action == 0:
                 continue
-            passed = self.passes_entry_filter(p, mode)
-            if passed:
+            p.filter_check = self.filter_check(p)
+            reason = self.entry_filter_reason(p, mode)
+            if reason == "pass":
                 candidates.append(p)
             else:
-                p.filter_reason = self.entry_filter_reason(p, mode)
+                p.filter_reason = reason
+                p.reject_stage = "entry_filter"
 
-        if not candidates or remaining_trades <= 0:
-            for i, p in enumerate(sorted(proposals, key=lambda x: self.score(x), reverse=True)):
-                p.rank = i
-            return {}
-
-        scored = [(self.score(p), p) for p in candidates]
-        scored.sort(key=lambda x: x[0], reverse=True)
+        scored = sorted(((self.score(p), p) for p in candidates), key=lambda x: x[0], reverse=True)
         for rank, (_, p) in enumerate(scored):
             p.rank = rank
+        hold_base = len(scored)
+        for p in proposals:
+            if p.action == 0:
+                p.rank = hold_base
+                hold_base += 1
 
-        # ── max_rank_eval: filter AFTER the ranking — p.rank is set now ──
-        # Eval only. max_rank_eval=2 -> approves rank0 and rank1 (0-indexed).
-        if mode != "train":
-            _max_rank = getattr(self, "_max_rank_eval", 99)
-            if _max_rank < 99:
-                scored = [(sv, p) for sv, p in scored if p.rank < _max_rank]
-                if not scored:
-                    hold_base = len(candidates)
-                    for p in proposals:
-                        if p.action == 0:
-                            p.rank = hold_base
-                            hold_base += 1
-                    return {}
+        # optional cap on the rank approved in eval (max_rank_eval, off by default)
+        if mode != "train" and self._max_rank_eval < 99:
+            for _, p in scored[self._max_rank_eval :]:
+                p.reject_stage = "max_rank"
+            scored = scored[: self._max_rank_eval]
 
         approved = {}
         for i, (sval, p) in enumerate(scored):
@@ -432,21 +373,7 @@ class TradeArbiter:
                 approved[p.asset] = p
             else:
                 p.approved = False
-                if p.action != 0:
-                    logger.debug(
-                        "[ARBITER] Rejected %s action=%d score=%.3f tmom_30m=%s",
-                        p.asset,
-                        p.action,
-                        sval,
-                        f"{p.tmom_30m:.2f}" if p.tmom_30m is not None else "n/a",
-                    )
-
-        hold_base = len(scored)
-        for p in proposals:
-            if p.action == 0:
-                p.rank = hold_base
-                hold_base += 1
-
+                p.reject_stage = "daily_quota" if i >= remaining_trades else "min_score"
         return approved
 
 
@@ -603,17 +530,6 @@ class MultiAssetRunner:
         self.MIN_Q_GAP_EVAL = (
             float(runner_cfg.get("min_q_gap", 0.05)) if self.mode != "train" else 0.0
         )
-        # ── Q-gap curriculum per rank in training ────────────────────────────
-        # In Run2/3 (train_filter_scale > 0) it gets progressively harder to
-        # approve low-quality trades. rank1 always passes (0.000),
-        # rank3+ need growing conviction.
-        # Off in Run1 (rank_qgap_train_r3=0.0 by default).
-        self._rank_qgap_train = {
-            0: 0.000,  # rank1: always free
-            1: float(runner_cfg.get("rank_qgap_train_r2", 0.000)),  # rank2: 0.010 in Run2
-            2: float(runner_cfg.get("rank_qgap_train_r3", 0.000)),  # rank3: 0.025 in Run2
-            3: float(runner_cfg.get("rank_qgap_train_r4", 0.000)),  # rank4+: 0.040 in Run2
-        }
         # ── Eval: filter on the highest approvable rank ───────────────────────
         # max_rank_eval=2 -> only rank1+rank2 (0-indexed: 0,1)
         # default 99 = no filter (Run1 compatibility)
@@ -858,6 +774,13 @@ class MultiAssetRunner:
         self.global_step = 0
         self.max_steps = 0  # set by run_loop through set_max_steps()
         self.global_daily_date = None
+        # the portfolio daily quota binds in eval / live; in training only if asked:
+        # an exploring agent fills it in the first bars of the day and would learn
+        # the value of its trades almost only at 00:00 UTC
+        self.train_daily_quota = bool(runner_cfg.get("train_daily_quota", False))
+        self._allowed_max_trades = None
+        self._entry_block = ""
+        self.decision_log: list[dict] = []  # eval: the agent's trade decisions, for the report
         self._daily_sl_warned_day = None  # ✅ explicit initialization
         self.trades_opened_today = 0
 
@@ -1254,23 +1177,62 @@ class MultiAssetRunner:
     # ──────────────────────────────────────────────────────────────────
     # MAIN STEP
     # ──────────────────────────────────────────────────────────────────
+    def _remaining_trades(self) -> int:
+        """Trades left today under the portfolio quota (none in training by default)."""
+        if self.mode == "train" and not self.train_daily_quota:
+            return 10**9
+        return max(0, self.arbiter.max_trades_per_day - self.trades_opened_today)
+
+    def _max_concurrent(self, soft_reduce: bool = False) -> int:
+        """Open positions allowed now: training schedule, eval_max_concurrent in eval."""
+        if soft_reduce:
+            return 1
+        return self.MAX_CONCURRENT if self.mode == "train" else self.EVAL_MAX_CONCURRENT
+
+    def _portfolio_entry_state(self) -> tuple[bool, str]:
+        """(True, "") if the portfolio can take one more trade now, else (False, reason)."""
+        if self.block_new_trades:
+            return False, "dd_block"
+        soft_reduce = False
+        if self.mode in ("eval", "live"):
+            if self.ks_enabled and self._check_kill_switch()[0]:
+                return False, "kill_switch"
+            daily_pnl = self.portfolio.daily_pnl_pct
+            if daily_pnl <= self.DAILY_BLOCK_PCT or (
+                self.portfolio.daily_losses >= self.MAX_DAILY_LOSSES
+            ):
+                return False, "daily_gate"
+            soft_reduce = daily_pnl <= self.DAILY_REDUCE_PCT
+        if self._remaining_trades() <= 0:
+            return False, "daily_quota"
+        n_open = sum(1 for env in self.envs.values() if env.position is not None)
+        if n_open >= self._max_concurrent(soft_reduce):
+            return False, "position_slots"
+        return True, ""
+
+    def _next_mask(self, env) -> list[bool]:
+        """Action mask of the env's next state, with the portfolio limits after this step."""
+        mask = env.get_valid_action_mask(max_trades_override=self._allowed_max_trades)
+        if not self._portfolio_entry_state()[0]:
+            mask = [True] + [False] * (len(mask) - 1)
+        return mask
+
     def step_once(self) -> tuple[dict, dict]:
         """
         Main Rainbow DQN step.
 
         Flow:
-        1. for every active asset: state + mask
-        2. q_values → Q-gap filter → act → TradeProposal
+        1. daily date reset; can the portfolio open anything now? (DD block, daily gate,
+           kill switch, daily quota, free position slots)
+        2. for every active asset: state + action mask (env limits + portfolio limits),
+           q_values → act → TradeProposal. Trades the portfolio can't take are masked,
+           so the agent's choice is executable instead of silently turned into HOLD
         3. health penalty (if on)
-        4. daily date reset
-        5. correlation cap: max MAX_CORRELATED_TRADES in the same direction
-        6. Arbiter.select() -> daily quota
-        7. Risk scaling: BASE_RISK × regime_mult × reduction_factor
-        8. Portfolio.reserve() -> confirms the funds are available
-        9. env.step() → reward shaping
-        10. Portfolio.apply_pnl() -> updates streak/block
+        4. Arbiter.select(): rank by advantage over HOLD, daily quota
+        5. position slots, risk scaling, Portfolio.reserve()
+        6. env.step() → reward shaping, next-state mask for the replay
+        7. Portfolio.apply_pnl() -> updates streak/block
         """
-        import torch
 
         self.global_step += 1
         self._apply_max_dd_schedule()
@@ -1290,6 +1252,31 @@ class MultiAssetRunner:
             if self.global_step < s_val:
                 allowed_max_trades = self.curriculum["max_trades"][max(0, s_idx - 1)]
                 break
+        self._allowed_max_trades = allowed_max_trades
+
+        # ── Daily date reset ──────────────────────────────────────────
+        try:
+            current_date = max(
+                env.timestamps[env.current_step].date()
+                for env in self.envs.values()
+                if env.current_step < len(env.timestamps)
+            )
+        except (ValueError, IndexError):
+            any_env = next(iter(self.envs.values()))
+            current_date = any_env.timestamps[
+                min(any_env.current_step, len(any_env.timestamps) - 1)
+            ].date()
+
+        if self.global_daily_date is None or current_date != self.global_daily_date:
+            self.global_daily_date = current_date
+            self.trades_opened_today = 0
+            self.portfolio.daily_losses = 0
+            self.portfolio._loss_day = current_date
+            self.portfolio.daily_pnl_pct = 0.0  # ✅ explicit P&L% reset when the day changes
+
+        # can the portfolio take one more trade at all? if not, every trade action is
+        # masked: the agent sees HOLD as its only choice instead of being overruled
+        entry_ok, self._entry_block = self._portfolio_entry_state()
 
         proposals: list[TradeProposal] = []
 
@@ -1334,6 +1321,8 @@ class MultiAssetRunner:
             )
             state = env._get_state()
             mask = env.get_valid_action_mask(max_trades_override=allowed_max_trades)
+            if not entry_ok:
+                mask = [True] + [False] * (len(mask) - 1)
             agent = self.agents[self.asset_class_map[asset]]
 
             state_t = torch.from_numpy(state).float().to(agent.device)
@@ -1376,11 +1365,14 @@ class MultiAssetRunner:
                 # Rank-based filters go AFTER arbiter.select().
             else:
                 # Eval/live step 1: Q-gap filter
+                agent_choice = int(np.argmax(q_masked))
+                conviction_stage = None
                 action_candidate = 0
                 if q_gap >= self.MIN_Q_GAP_EVAL:
                     # Step 2: positive Q filter (the agent expects a positive return)
                     if self._eval_require_positive_q and best_trade_q <= 0:
                         action_candidate = 0
+                        conviction_stage = "positive_q"
                         self.arbiter_stats["positive_q_blocked"] += 1
                     else:
                         action_candidate = int(np.argmax(q_masked))
@@ -1395,16 +1387,14 @@ class MultiAssetRunner:
                         agent.online.sample_noise()
                         q_v = agent.q_values(state_t)
                         q_mv = q_v.cpu().numpy().copy()
-                        if not mask_arr[1]:
-                            q_mv[1] = -1e9
-                        if not mask_arr[2]:
-                            q_mv[2] = -1e9
+                        q_mv[~mask_arr] = -1e9  # every masked action (MR included)
                         v_a = int(np.argmax(q_mv))
                         votes.append(v_a)
                     # count the votes for the candidate action
                     vote_count = votes.count(action_candidate)
                     if vote_count < self._eval_vote_threshold:
                         action_candidate = 0
+                        conviction_stage = "vote"
                         self.arbiter_stats["vote_blocked"] += 1
                     else:
                         # refresh the noise for the final normal forward pass
@@ -1413,6 +1403,7 @@ class MultiAssetRunner:
                 best_action = action_candidate
                 if best_action == 0 and q_gap < self.MIN_Q_GAP_EVAL:
                     self.arbiter_stats["qgap_filtered"] += 1
+                    conviction_stage = "q_gap"
 
             idx_read = min(env.current_step, len(env.df) - 1)
             atr = float(env.df.iloc[idx_read].get(env.atr_col, 0.0)) if env.atr_col else 0.0
@@ -1493,6 +1484,7 @@ class MultiAssetRunner:
             prop.q_vals_raw = q_np
             prop.q_vals_masked = q_masked
             prop.valid_mask = mask_arr
+            prop.q_hold = q_hold
 
             # v26: strategy outcome signals from the env cache (precomputed in _get_state)
             _p_tl = getattr(env, "_strat_p_tp_tl", None)
@@ -1522,6 +1514,13 @@ class MultiAssetRunner:
             # v26: session validity — bars to the next force close
             prop.bars_to_force_close = getattr(env, "_bars_to_fc", None)
 
+            # eval: the agent wanted a trade, its own conviction filters said no
+            if self.mode != "train" and best_action == 0 and agent_choice != 0:
+                prop.reject_stage = conviction_stage or "q_gap"
+                prop.filter_check = self.arbiter.filter_check(
+                    dataclasses.replace(prop, action=agent_choice)
+                )
+                prop.shadow_action = agent_choice
             proposals.append(prop)
 
         # ── Health penalty ────────────────────────────────────────────
@@ -1533,27 +1532,7 @@ class MultiAssetRunner:
 
         self.arbiter_stats["total_proposals"] += len(proposals)
 
-        # ── Daily date reset ──────────────────────────────────────────
-        try:
-            current_date = max(
-                env.timestamps[env.current_step].date()
-                for env in self.envs.values()
-                if env.current_step < len(env.timestamps)
-            )
-        except (ValueError, IndexError):
-            any_env = next(iter(self.envs.values()))
-            current_date = any_env.timestamps[
-                min(any_env.current_step, len(any_env.timestamps) - 1)
-            ].date()
-
-        if self.global_daily_date is None or current_date != self.global_daily_date:
-            self.global_daily_date = current_date
-            self.trades_opened_today = 0
-            self.portfolio.daily_losses = 0
-            self.portfolio._loss_day = current_date
-            self.portfolio.daily_pnl_pct = 0.0  # ✅ explicit P&L% reset when the day changes
-
-        remaining_trades = max(0, self.arbiter.max_trades_per_day - self.trades_opened_today)
+        remaining_trades = self._remaining_trades()
 
         # ── PHASE 1.5: portfolio-level kill switch (eval/live only) ──
         # 4 conditions: drawdown velocity, loss streak, P&L anomaly, stuck.
@@ -1648,6 +1627,7 @@ class MultiAssetRunner:
                 ok, reason = self._passes_decision_gate(prop)
                 if not ok:
                     prop.approved = False
+                    prop.reject_stage = "decision_gate"
                     prop.filter_reason = f"decision_gate:{reason}"
                     del approved_map[asset]
                     self.arbiter_stats["decision_gate_blocked"] += 1
@@ -1658,13 +1638,14 @@ class MultiAssetRunner:
         # After daily_reduce (P&L < -1%): down to 1.
         # Always picks the best-ranked trades among the approved ones.
         n_open = sum(1 for env in self.envs.values() if env.position is not None)
-        effective_max = 1 if soft_reduce else self.MAX_CONCURRENT
+        effective_max = self._max_concurrent(soft_reduce)
         slots_available = max(0, effective_max - n_open)
 
         if slots_available == 0:
             # no free slot: block everything
             for asset in list(approved_map.keys()):
                 approved_map[asset].approved = False
+                approved_map[asset].reject_stage = "position_slots"
                 self.arbiter_stats["corr_filtered"] += 1
                 self.arbiter_stats["concurrent_blocked"] += 1
             approved_map.clear()
@@ -1677,6 +1658,7 @@ class MultiAssetRunner:
             )
             for asset in ranked[slots_available:]:
                 approved_map[asset].approved = False
+                approved_map[asset].reject_stage = "position_slots"
                 self.arbiter_stats["corr_filtered"] += 1
                 self.arbiter_stats["concurrent_blocked"] += 1
                 del approved_map[asset]
@@ -1713,6 +1695,7 @@ class MultiAssetRunner:
                 reserved_assets[asset] = risk_amount
             else:
                 prop.approved = False
+                prop.reject_stage = "no_capital"
                 del approved_map[asset]
 
         # ── Approval stats ──────────────────────────────────────
@@ -1879,6 +1862,7 @@ class MultiAssetRunner:
                 "is_ppo": False,
                 "rollout_step": None,
             }
+            self._log_decision(prop, pre_step, action_to_exec, opened)
 
             if prop.approved and opened:
                 self.trades_opened_today += 1
@@ -1959,7 +1943,31 @@ class MultiAssetRunner:
             if env is None or env.position is None:
                 self.portfolio.release(asset)
 
+        # actions available in each next state, with the portfolio as it is now
+        for asset, tr in transitions.items():
+            tr["next_mask"] = self._next_mask(self.envs[asset])
+
         return transitions, {k: v for k, v in approved_map.items()}
+
+    def _log_decision(self, prop: TradeProposal, step_idx: int, executed: int, opened: bool):
+        """Eval: every trade the agent wanted, with what happened to it (counterfactual report)."""
+        if self.mode == "train":
+            return
+        action = prop.action or prop.shadow_action
+        if action == 0:
+            return
+        if prop.filter_check is None:
+            prop.filter_check = self.arbiter.filter_check(dataclasses.replace(prop, action=action))
+        self.decision_log.append(
+            {
+                "asset": prop.asset,
+                "step": int(step_idx),
+                "action": int(action),
+                "opened": bool(opened and executed == action),
+                "stage": "opened" if opened and executed == action else prop.reject_stage,
+                "filter_check": prop.filter_check,
+            }
+        )
 
     def _execute_holds(self, proposals, approved_map):
         transitions = {}
@@ -1969,6 +1977,7 @@ class MultiAssetRunner:
             env = self.envs[asset]
             ns, r, done, info = env.step(0, external_risk_amount=None)
             info = info or {}
+            # stored in the replay by the training loop like every other transition
             transitions[asset] = {
                 "state": prop.state,
                 "action": 0,
@@ -1979,17 +1988,11 @@ class MultiAssetRunner:
                 "proposal": prop,
                 "is_ppo": False,
                 "rollout_step": None,
+                "next_mask": self._next_mask(env),
             }
-
-            # ✅ FIX: store the transitions in the replay buffer during the blocks too
-            # The agent must learn that HOLD while blocked = low reward
-            if self.mode == "train":
-                agent = self.agents.get(self.asset_class_map.get(asset))
-                if agent is not None:
-
-                    s_t = torch.from_numpy(np.array(prop.state, dtype=np.float32))
-                    ns_t = torch.from_numpy(np.array(ns, dtype=np.float32))
-                    agent.store(s_t, 0, float(r), ns_t, bool(done), tag="hold", env_id=asset)
+            if prop.action != 0 and prop.reject_stage is None:
+                prop.reject_stage = self._entry_block or "blocked"
+            self._log_decision(prop, env.current_step - 1, 0, False)
 
             if len(env.episode_trades) > pre_counts[asset]:
                 last = env.episode_trades[-1]

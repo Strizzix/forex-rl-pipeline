@@ -189,26 +189,37 @@ heads, noisy layers instead of epsilon, prioritized replay on a SumTree and N-st
 **per asset**, so sequences of different assets never mix. An elite buffer keeps the best
 ranked trades and samples them in every batch.
 
-**Arbiter and runner** (`agent/arbiter.py`). Every step `MultiAssetRunner` asks the agent for
-the Q-values of every asset, `TradeArbiter` turns them into proposals, scores them (Q-gap and
-encoder signals agreeing with the direction), applies the entry filters (DI direction,
-breakout probability, regime uncertainty, time to the forced close), and only the best ones,
-up to the concurrent-positions cap, are executed on a shared `Portfolio`. Daily loss limits,
-drawdown ladders and a kill switch (drawdown velocity, ATR spikes, PnL anomalies) stop the
-trading when needed.
+**Arbiter and runner** (`agent/arbiter.py`). The agent decides, the arbiter manages the
+portfolio risk. Every step `MultiAssetRunner` gives the agent an action mask with everything
+that can't be done right now — position already open, entry lockouts, day's trades, daily DD
+budget, and the portfolio limits: free position slots, daily loss gate, drawdown block, kill
+switch — so its choice is always executable instead of being turned into HOLD behind its back
+(the replay keeps the mask of the next state, and the Q target only looks at the available
+actions). `TradeArbiter` ranks the trades proposed in the same step by the agent's advantage
+over HOLD, Q(a) − Q(HOLD), and the best ones fill the free slots. Risk is scaled by the
+drawdown ladders; the portfolio daily quota binds in eval only (`train_daily_quota`).
+
+The v26 arbiter is still there as options: `score_mode: "legacy"` (Q plus trend / regime /
+breakout / strategy-outcome bonuses) and `entry_filters: true` (trend only with tmom / ADX /
+DI agreeing, MR only in a ranging market, regime uncertainty, time to the close), with the same
+thresholds in training and eval. With the filters off their verdict is still computed: every
+eval summary has a **`counterfactual`** report that replays each trade the agent wanted with
+the env rules and gives mean R and win rate per stage (opened, stopped by the Q-gap / vote,
+by the position slots, the quota...) and per filter verdict — if the trades a filter would
+remove do as well as the ones it keeps, the filter only costs trades.
 
 **Runs** (`agent/config.py`, `RUN_CONFIGS`):
 
 | Run | What | Output |
 |---|---|---|
-| `run1_majors` / `run1_minors` | one class at a time, light filters, exploration | `Exploration/<class>` |
-| `run2_joint` | Majors + Minors on one portfolio, starts from the two Run1 agents merged, filters at 40% | `Consolidation/Joint` |
-| `run3_joint` | joint, filters at 100% (train = eval) | `Production/Joint` |
+| `run1_majors` / `run1_minors` | one class at a time, wide DD, exploration | `Exploration/<class>` |
+| `run2_joint` | Majors + Minors on one portfolio, starts from the two Run1 agents merged, tighter DD, vote in eval | `Consolidation/Joint` |
+| `run3_joint` | joint, prop-firm limits (DD, daily losses, 2 positions), kill switch | `Production/Joint` |
 
 Every run is walk-forward (`wf_splits`): one encoder checkpoint per WF (Bootstrap, then the
 retrain of each WF), the agent of a WF starts from the one of the previous WF, each WF is
-evaluated out-of-sample on the next half-year. Per WF it saves the agent, a training log and
-`eval_summary_<wf>.json` / `val_summary_<wf>.json`:
+evaluated out-of-sample on the next half-year (joint runs included). Per WF it saves the
+agent, a training log and `eval_summary_<wf>.json` / `val_summary_<wf>.json`:
 
 ```
 <models>/Rainbow/runs/Exploration/<class>/<class>_<wf>/<class>_agent_<wf>.pth
@@ -402,7 +413,9 @@ Offline, on synthetic data:
   entry filters; trade-outcome labels and calendar (force close / lockout) against the env;
   on a real encoder (one bootstrap epoch + strategy head): the env input equal to the encoder
   training input, real heads (trend in [-3, 3], DI direction in [-1, 1]), state size and steps;
-  config overrides and checkpoint discovery; one walk-forward WF through the CLI
+  advantage ranking, filters off by default and equal in train / eval, portfolio limits as
+  action masks, next-state masks in the replay; config overrides and checkpoint discovery;
+  one walk-forward WF through the CLI with the counterfactual report
 
 ---
 
