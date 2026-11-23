@@ -21,7 +21,6 @@ come from the encoder package, so the agent sees exactly what the encoder was tr
 import logging
 import os
 from collections import deque
-from datetime import timezone
 from typing import Any, Optional
 
 import numpy as np
@@ -37,6 +36,8 @@ from encoder.components import (
     TrendMomentumHeadTF,
 )
 from encoder.dataset import autodetect_feature_columns, encoder_input_matrix
+
+from . import market_calendar as mcal
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -181,6 +182,10 @@ def load_encoder_from_checkpoint(
     encoder, n_inputs, hidden = _build_encoder(_strip_prefix(state), seq_len)
     encoder.input_features = n_inputs
     encoder.input_meta = (ckpt.get("extra") or {}).get("inputs")
+    # data window the encoder was trained on (None in older checkpoints): the agent's
+    # test period must come after it
+    _extra = ckpt.get("extra") or {}
+    encoder.train_end = _extra.get("train_end")
     heads = _build_heads(ckpt, hidden)
     modules = [encoder] + [m for m in heads.values() if m is not None]
     for m in modules:
@@ -382,9 +387,20 @@ class MarketEnv:
         self.exposure_penalty_per_bar = float(config.get("exposure_penalty_per_bar", 0.01))
         self.historical_24h_bars = int(config.get("historical_24h_bars", 96))
 
-        # ✅ dense reward params
-        self.mtm_scale = float(config.get("mtm_scale", 0.3))
-        self.opp_cost_scale = float(config.get("opp_cost_scale", 0.002))
+        # dense reward params
+        # mark-to-market shaping: "delta" = potential-based (gamma * phi' - phi, phi =
+        # mtm_scale * open R), which moves credit earlier in the trade without changing
+        # what the best policy is; "level" = mtm_scale * open R * decay every bar
+        self.mtm_scale = (
+            float(config.get("mtm_scale", 0.3)) if config.get("mtm_reward_enabled", True) else 0.0
+        )
+        self.mtm_mode = str(config.get("mtm_mode", "delta"))
+        self.mtm_gamma = float(config.get("gamma", 0.99))
+        self.opp_cost_scale = (
+            float(config.get("opportunity_cost_scale", config.get("opp_cost_scale", 0.002)))
+            if config.get("opportunity_cost_enabled", True)
+            else 0.0
+        )
         self.opp_cost_trend_threshold = float(config.get("opp_cost_trend_threshold", 0.5))
         self.sharpe_bonus_scale = float(config.get("sharpe_bonus_scale", 0.05))
         self.sharpe_window_bars = int(config.get("sharpe_window_bars", 96 * 22))
@@ -488,6 +504,7 @@ class MarketEnv:
         self._last_dd = 0.0
         self._last_closed_result = None
         self._last_close_price = None
+        self._mtm_phi = 0.0
 
         if hasattr(self, "_regime_history_1h"):
             self._regime_history_1h.clear()
@@ -536,9 +553,10 @@ class MarketEnv:
         self.episode_rewards = []
         self._last_z = None
         self._last_dd = 0.0
+        self._mtm_phi = 0.0 if self.position is None else getattr(self, "_mtm_phi", 0.0)
 
     # ------------------------------------------------------------------
-    # ✅ PPO: PRIVILEGED STATE (Asymmetric Critic — TRAINING ONLY)
+    # PPO: PRIVILEGED STATE (Asymmetric Critic — TRAINING ONLY)
     # ------------------------------------------------------------------
 
     def get_privileged_state(self, n_future: int = 16) -> np.ndarray:
@@ -577,7 +595,7 @@ class MarketEnv:
         return result
 
     # ------------------------------------------------------------------
-    # ✅ PPO: DENSE REWARD — Mark-to-Market
+    # PPO: DENSE REWARD — Mark-to-Market
     # ------------------------------------------------------------------
 
     def _mtm_reward(self, idx: int) -> float:
@@ -597,35 +615,30 @@ class MarketEnv:
           bar 24 → decay=0.50
           bar 48 → decay=min_decay (0.1)
         """
+        if self.mtm_scale == 0.0:
+            return 0.0
+        open_r = 0.0 if self.position is None else self._open_r(self._close_now(idx))
+
+        if self.mtm_mode == "delta":
+            # potential-based: sums to ~0 over a trade (the last step gives back phi),
+            # so it can't be farmed by holding and doesn't change the best policy
+            phi = self.mtm_scale * float(np.clip(open_r, -3.0, 3.0))
+            reward = self.mtm_gamma * phi - getattr(self, "_mtm_phi", 0.0)
+            self._mtm_phi = phi
+            return float(reward)
+
         if self.position is None:
             return 0.0
-
-        close_now = (
-            float(self.df[self._close_raw_col].iloc[idx])
-            if self._close_raw_col
-            else float(self.close.iloc[idx])
-        )
-
-        entry = float(self.position["entry"])
-        size = float(self.position["size"])
-        risk_amount = max(float(self.position.get("risk_amount", 1.0)), 1e-6)
-
-        unrealized = (
-            (close_now - entry) * size
-            if self.position["dir"] == "LONG"
-            else (entry - close_now) * size
-        )
-
-        # MTM decay: pushes towards closing, avoids holding forever
+        # "level": MTM decay pushes towards closing, avoids holding forever
         bars_open = int(self.position.get("open_bars", 0))
         max_bars_decay = float(self.cfg.get("mtm_max_bars_decay", 48))  # ~12h
         min_decay = float(self.cfg.get("mtm_min_decay", 0.1))
         decay = max(min_decay, 1.0 - bars_open / max(1.0, max_bars_decay))
 
-        return float(np.clip((unrealized / risk_amount) * self.mtm_scale * decay, -0.5, 0.5))
+        return float(np.clip(open_r * self.mtm_scale * decay, -0.5, 0.5))
 
     # ------------------------------------------------------------------
-    # ✅ PPO: DENSE REWARD — Opportunity Cost
+    # PPO: DENSE REWARD — Opportunity Cost
     # ------------------------------------------------------------------
 
     def _opportunity_cost_penalty(self, idx: int) -> float:
@@ -664,7 +677,7 @@ class MarketEnv:
         return -self.opp_cost_scale * move * conf_scale
 
     # ------------------------------------------------------------------
-    # ✅ PPO: SHARPE BONUS (periodic)
+    # PPO: SHARPE BONUS (periodic)
     # ------------------------------------------------------------------
 
     def _maybe_sharpe_bonus(self) -> float:
@@ -686,19 +699,10 @@ class MarketEnv:
     # ------------------------------------------------------------------
 
     # ────────────────────────────────────────────────────────────────────
-    # Time-based force close + entry lockout — UTC-based
-    # All times in UTC (GMT) since parquet timestamps are UTC. No DST issues.
-    #
-    # Force close (positions closed by the env):
-    #   • Mon-Thu 21:30 UTC: "overnight" — 30 min before the swap rollover (22:00 GMT)
-    #   • Fri      21:30 UTC: "friday_weekend" — avoids the weekend gap
-    #   • Saturday: defensive (the FX feed should already be closed)
-    #
-    # Entry lockout (no new positions):
-    #   • Mon-Thu 20:30 UTC → 21:30 UTC: 1h before the close
-    #   • Friday  20:30 UTC → 21:30 UTC: 1h before the weekly close
-    #   • Sunday  before 22:00 UTC: market reopen — illiquid
-    #   • Saturday: closed
+    # Calendar (agent/market_calendar.py), in market time = New York + 5h (UTC in winter):
+    #   force close: Wednesday (triple swap) and Friday (weekend) from 21:30
+    #   entry lockout: Wednesday / Friday from 20:30, Sunday before 22:00, Saturday
+    #   swap: at the 22:00 rollover (17:00 New York), Wednesday x3
     # ────────────────────────────────────────────────────────────────────
     # ── Action space constants (v26: 5 actions) ────────────────────────
     # ── Swap tables (pip cost per standard lot — plausible worst case) ──
@@ -716,10 +720,7 @@ class MarketEnv:
         "NZDUSD": {"LONG": 5.0, "SHORT": 1.0},
     }
     _PIP_VALUE_PER_LOT: float = 10.0  # USD per pip per standard lot (approximation)
-    _SWAP_APPLY_HM_UTC = (22, 0)  # NY close rollover
 
-    # NEW v26+: daily force close REMOVED for Mon/Tue/Thu.
-    # Kept ONLY for Wednesday (triple swap) and Friday (weekend).
     ACT_HOLD = 0
     ACT_LONG_TREND = 1
     ACT_SHORT_TREND = 2
@@ -729,21 +730,30 @@ class MarketEnv:
     _ACT_STRATEGY = {0: "hold", 1: "trend", 2: "trend", 3: "mr", 4: "mr"}
     _ACT_DIR = {0: None, 1: "LONG", 2: "SHORT", 3: "LONG", 4: "SHORT"}
 
-    _UTC_TZ = timezone.utc
-    _DAILY_CLOSE_HM_UTC = (21, 30)  # Wed/Fri force-close only
-    _DAILY_LOCKOUT_HM_UTC = (20, 30)  # no entries 1h pre Wed/Fri close
-    _SUNDAY_REOPEN_LOCKOUT_UTC = (22, 0)  # Sunday before 22:00: no entries
+    def _calendar(self) -> dict[str, np.ndarray]:
+        """Market clock, force-close / lockout masks and swap days of every row (cached)."""
+        cal = getattr(self, "_calendar_cache", None)
+        if cal is None:
+            index = pd.DatetimeIndex(self.timestamps)
+            hm, dow = mcal.market_clock(index)
+            cal = self._calendar_cache = {
+                "hm": hm,
+                "dow": dow,
+                "force_close": mcal.force_close_mask(index),
+                "lockout": mcal.entry_lockout_mask(index),
+                "swap_days": mcal.swap_days(index),
+                "rows_to_fc": mcal.rows_to_force_close(index),
+            }
+        return cal
 
     def _ts_utc(self, idx: int) -> Optional[tuple[int, int, int]]:
-        """Return (hour, minute, dayofweek) in UTC. Parquet is already UTC."""
+        """(hour, minute, weekday) in market time (New York + 5h, = UTC in winter):
+        the session rules follow the 17:00 New York rollover all year."""
         if idx >= len(self.timestamps):
             return None
-        ts = self.timestamps[idx]
-        try:
-            # Parquet timestamps are UTC; if naive, treat as UTC
-            return int(ts.hour), int(ts.minute), int(ts.weekday())
-        except Exception:
-            return None
+        cal = self._calendar()
+        hm = int(cal["hm"][idx])
+        return hm // 60, hm % 60, int(cal["dow"][idx])
 
     def _is_time_force_close(self, idx: int) -> Optional[str]:
         """
@@ -753,16 +763,9 @@ class MarketEnv:
         Returns: "wednesday_swap" | "friday_weekend" | None
         """
         info = self._ts_utc(idx)
-        if info is None:
+        if info is None or not self._calendar()["force_close"][idx]:
             return None
-        h, m, dow = info  # 0=Mon ... 4=Fri ... 5=Sat ... 6=Sun
-        if dow == 5:
-            return "friday_weekend"
-        if dow == 4 and (h, m) >= self._DAILY_CLOSE_HM_UTC:
-            return "friday_weekend"
-        if dow == 2 and (h, m) >= self._DAILY_CLOSE_HM_UTC:
-            return "wednesday_swap"
-        return None
+        return "wednesday_swap" if info[2] == 2 else "friday_weekend"
 
     def _is_entry_lockout(self, idx: int) -> bool:
         """
@@ -775,19 +778,11 @@ class MarketEnv:
           • Sunday    before 22:00 UTC: illiquid market reopen
           • Saturday: closed
         """
-        info = self._ts_utc(idx)
-        if info is None:
+        if idx >= len(self.timestamps):
             return False
-        h, m, dow = info
-        if dow == 5:
-            return True  # Saturday: closed
-        if dow == 6 and (h, m) < self._SUNDAY_REOPEN_LOCKOUT_UTC:
-            return True  # Sunday before 22:00
-        # Wednesday (2) and Friday (4): 1h lockout before the close
-        if dow in (2, 4) and (h, m) >= self._DAILY_LOCKOUT_HM_UTC:
-            return True
-        return False
+        return bool(self._calendar()["lockout"][idx])
 
+    @staticmethod
     def _spread_time_multiplier(ts_utc_hour: int, dow: int) -> float:
         """
         Returns spread multiplier ≥ 1.0 based on UTC hour and DOW.
@@ -821,25 +816,16 @@ class MarketEnv:
           captures spread widening on news/macro spikes
         """
         if self.spread_col in self.df.columns:
-            val = self.df.iloc[idx].get(self.spread_col, 0.0)
-            base = 0.0 if pd.isna(val) else float(val)
+            val = self.df.iloc[idx].get(self.spread_col, np.nan)
+            # unknown spread (one-sided quotes all bar): the fixed default, not free
+            base = float(self.cfg.get("default_spread", 0.0001)) if pd.isna(val) else float(val)
         else:
             base = float(self.cfg.get("default_spread", 0.0001))
 
         # Time-of-day multiplier (DST-aware would be marginal — UTC is sufficient
         # since liquidity windows are tied to global session opens, not local time).
-        try:
-            ts = self.timestamps[idx]
-            if ts.tzinfo is None:
-                h_utc = int(ts.hour)
-                dow = int(ts.weekday())
-            else:
-                ts_utc = ts.astimezone(timezone.utc) if ts.tzinfo != timezone.utc else ts
-                h_utc = int(ts_utc.hour)
-                dow = int(ts_utc.weekday())
-            time_mult = self._spread_time_multiplier(h_utc, dow)
-        except Exception:
-            time_mult = 1.0
+        info = self._ts_utc(idx)
+        time_mult = 1.0 if info is None else self._spread_time_multiplier(info[0], info[2])
 
         # Volatility-driven widening: when vol_15m > 1σ above mean (z-score)
         # spread widens proportionally. Captures news/macro spikes.
@@ -853,12 +839,14 @@ class MarketEnv:
 
         return base * time_mult * vol_mult
 
-    def _compute_position_size(self, atr_value: float, risk_amount: float) -> float:
+    def _compute_position_size(
+        self, atr_value: float, risk_amount: float, sl_mult: Optional[float] = None
+    ) -> float:
         if risk_amount <= 0:
             return self.min_lot
         pip_size = float(self.cfg.get("pip_size", 0.0001))
         atr_pips = atr_value / max(1e-12, pip_size)
-        sl_pips = atr_pips * self.sl_atr_mult
+        sl_pips = atr_pips * (self.sl_atr_mult if sl_mult is None else sl_mult)
         lots = risk_amount / max(1e-12, sl_pips * self.pip_value)
         return min(float(self.cfg.get("max_lot", 10.0)), max(self.min_lot, round(lots, 2)))
 
@@ -910,14 +898,15 @@ class MarketEnv:
         # net P&L (commission included), not -risk_target - extra commission.
         # Example: risk_target=$50, commission=$3 → risk_operational=$47, size computed on $47
         # SL hit: raw loss $47 + commission $3 = -$50 total = exactly -risk_target.
-        size_est = self._compute_position_size(atr, risk_target)
-        commission_charge = size_est * self.commission_per_lot  # one-time entry charge
-        risk_operational = max(0.0, risk_target - commission_charge)
-        size = self._compute_position_size(atr, risk_operational)
-
         _rr_use = self.rr_mr if strategy == "mr" else self.rr
         _sl_use = self.sl_atr_mult_mr if strategy == "mr" else self.sl_atr_mult
         _bars_use = self.max_bars_mr if strategy == "mr" else self.max_bars_per_trade
+
+        # lots for the SL of THIS strategy (the MR stop is sized with its own multiple)
+        size_est = self._compute_position_size(atr, risk_target, _sl_use)
+        commission_charge = size_est * self.commission_per_lot  # one-time entry charge
+        risk_operational = max(0.0, risk_target - commission_charge)
+        size = self._compute_position_size(atr, risk_operational, _sl_use)
         sl = entry_price - atr * _sl_use if direction == "LONG" else entry_price + atr * _sl_use
         tp = (
             entry_price + atr * _sl_use * _rr_use
@@ -936,7 +925,10 @@ class MarketEnv:
             "entry": entry_price,
             "sl": sl,
             "tp": tp,
+            "risk_dist": abs(entry_price - sl),  # 1 R in price
             "size": size,
+            "commission": size * self.commission_per_lot,  # already taken from the balance
+            "swap_usd": 0.0,  # swaps paid so far, already taken from the balance
             "risk_amount": risk_operational,
             "entry_idx": idx,
             "open_bars": 0,
@@ -948,6 +940,22 @@ class MarketEnv:
         }
         self._last_close_price = entry_price
         return True
+
+    def _open_r(self, price: float) -> float:
+        """Result of the open position at ``price``, in R (1 R = entry-to-SL distance).
+        Money = R x risk_amount, the same accounting as the SL / TP exits."""
+        pos = self.position
+        if pos is None:
+            return 0.0
+        entry = float(pos["entry"])
+        dist = float(pos.get("risk_dist") or abs(entry - float(pos["sl"])))
+        move = price - entry if pos["dir"] == "LONG" else entry - price
+        return move / max(dist, 1e-12)
+
+    def _close_now(self, idx: int) -> float:
+        if self._close_raw_col:
+            return float(self.df[self._close_raw_col].iloc[idx])
+        return float(self.close.iloc[idx])
 
     def _close_position(self, rr_result: float) -> tuple[float, float, int]:
         if self.position is None:
@@ -961,13 +969,18 @@ class MarketEnv:
         pnl = rr_result * risk_amount
         open_bars = int(self.position.get("open_bars", 0))
 
-        # commission charged ONLY at the entry. Not again at the close.
-        # one charge per trade — already in risk_operational.
+        # commission (entry) and swaps were taken from the balance when paid; the trade's
+        # P&L reported to the stats and to the portfolio is net of them, so the sum of
+        # the trades is the balance change
         self.balance += pnl
+        pnl -= float(self.position.get("commission", 0.0)) + float(
+            self.position.get("swap_usd", 0.0)
+        )
         if self.balance <= 0:
             self.balance = 0.0
             self.bankrupt = True
 
+        self._last_closed_position = self.position
         self.position = None
         self._last_close_price = None
         return float(pnl), float(risk_amount), int(open_bars)
@@ -1363,20 +1376,8 @@ class MarketEnv:
         spread_norm = float(np.clip(spread_raw / (atr_ref + 1e-9), 0.0, 1.0))
 
         if self.position is not None:
-            pos_entry = float(self.position["entry"])
-            pos_size = float(self.position["size"])
-            pos_risk = max(float(self.position.get("risk_amount", 1.0)), 1e-6)
-            close_now_raw = (
-                float(self.df[self._close_raw_col].iloc[idx])
-                if self._close_raw_col
-                else float(self.close.iloc[idx])
-            )
-            unreal = (
-                (close_now_raw - pos_entry) * pos_size
-                if self.position["dir"] == "LONG"
-                else (pos_entry - close_now_raw) * pos_size
-            )
-            unrealized_pnl_norm = float(np.clip(unreal / pos_risk, -3.0, 3.0))
+            close_now_raw = self._close_now(idx)
+            unrealized_pnl_norm = float(np.clip(self._open_r(close_now_raw), -3.0, 3.0))
 
             # bars since the entry -> [0, 1+]
             bars_open = int(self.position.get("open_bars", 0))
@@ -1384,15 +1385,10 @@ class MarketEnv:
                 np.tanh(bars_open / 96.0)
             )  # tanh: 24h→0.6, 48h→0.9 — no hard max_bars
 
-            # MFE — max favourable excursion, normalized by ATR×sl_mult → [0, 3]
-            mfe_raw = float(self.position.get("max_favorable_excursion", 0.0))
-            mfe_norm = float(np.clip(mfe_raw / (atr_ref * self.sl_atr_mult + 1e-9), 0.0, 3.0))
-
-            # MAE — max loss seen, normalized by ATR×sl_mult -> [0, 3]  ← v2
-            # MAE = lowest unrealized PnL / risk_amount seen during the trade
-            # updated in step() together with MFE
-            mae_raw = float(self.position.get("max_adverse_excursion", 0.0))
-            mae_norm = float(np.clip(mae_raw / (atr_ref * self.sl_atr_mult + 1e-9), 0.0, 3.0))
+            # MFE / MAE — best and worst close seen in the trade, already in R -> [0, 3]
+            # (updated in step())
+            mfe_norm = float(np.clip(self.position.get("max_favorable_excursion", 0.0), 0.0, 3.0))
+            mae_norm = float(np.clip(self.position.get("max_adverse_excursion", 0.0), 0.0, 3.0))
 
             # distance from SL and TP normalized by ATR  ← v2
             # sl/tp are raw prices (computed with ATR14_15min_raw in _open_position)
@@ -1539,20 +1535,9 @@ class MarketEnv:
         # ── v26: bars_to_force_close — trading session left ────────────
         # how many 15min bars are left before the next force close (21:30 UTC)?
         # used as a state feature, as an arbiter penalty and as a hard gate.
-        _fc_h, _fc_m = self._DAILY_CLOSE_HM_UTC  # (21, 30)
-        _ts_now = pd.to_datetime(self.timestamps[idx])
-        if _ts_now.tzinfo is not None:
-
-            _ts_utc = _ts_now.tz_convert("UTC")
-        else:
-            _ts_utc = _ts_now
-        _cur_min = _ts_utc.hour * 60 + _ts_utc.minute
-        _close_min = _fc_h * 60 + _fc_m
-        if _cur_min < _close_min:
-            _delta_min = _close_min - _cur_min
-        else:
-            _delta_min = (24 * 60 - _cur_min) + _close_min
-        _bars_to_fc = max(1, _delta_min // 15)  # 15min bars to the force close
+        # the next REAL force close (Wednesday / Friday 21:30 market time): Mon/Tue/Thu
+        # have none since v26, so they're "far" instead of "21:30 is close"
+        _bars_to_fc = max(1, int(self._calendar()["rows_to_fc"][idx]))
         bars_to_fc_norm = float(np.clip(_bars_to_fc / 96.0, 0.0, 1.0))  # norm su 24h
         is_near_fc = 1.0 if _bars_to_fc < 16 else 0.0  # <4h = danger zone
         # Cache for the arbiter
@@ -1665,12 +1650,12 @@ class MarketEnv:
         """
         if self.position is None:
             return 0.0
-        info = self._ts_utc(idx)
-        if info is None:
+        # rollovers (17:00 New York) between the previous row and this one, Wednesday x3;
+        # nothing on the bar the position was opened at (opened at its close)
+        if idx >= len(self.timestamps) or int(self.position.get("entry_idx", idx)) >= idx:
             return 0.0
-        h, m, dow = info
-        # the swap is applied once a night at 22:00 UTC (NY close rollover)
-        if (h, m) != self._SWAP_APPLY_HM_UTC:
+        n_swaps = float(self._calendar()["swap_days"][idx])
+        if n_swaps <= 0:
             return 0.0
 
         direction = self.position["dir"]
@@ -1678,11 +1663,8 @@ class MarketEnv:
         size = float(self.position.get("size", 0.0))
         risk_amount = max(float(self.position.get("risk_amount", 1.0)), 1.0)
 
-        # Cost in $ = swap_pips × pip_value × lots
-        swap_cost_usd = swap_pips * self._PIP_VALUE_PER_LOT * size
-        # Wednesday: triple swap
-        if dow == 2:
-            swap_cost_usd *= 3.0
+        # Cost in $ = swap_pips × pip_value × lots (× 3 on Wednesday)
+        swap_cost_usd = swap_pips * self._PIP_VALUE_PER_LOT * size * n_swaps
         # Convert to R
         swap_cost_r = swap_cost_usd / risk_amount
         # apply to the balance
@@ -1691,6 +1673,7 @@ class MarketEnv:
         # update the days-held counter and the swap accumulator
         days_held = int(self.position.get("open_bars", 0)) // 96 + 1  # ~96 bars/day @15min
         self.position["swap_cost_r"] = float(self.position.get("swap_cost_r", 0.0)) + swap_cost_r
+        self.position["swap_usd"] = float(self.position.get("swap_usd", 0.0)) + swap_cost_usd
         self.position["days_held"] = max(int(self.position.get("days_held", 0)), days_held)
         return -swap_cost_r  # negative reward
 
@@ -1807,28 +1790,13 @@ class MarketEnv:
         if self.position is not None:
             self.position["open_bars"] = int(self.position.get("open_bars", 0)) + 1
             # update the Max Favorable Excursion (MFE) for the state features
-            close_cur = (
-                float(self.df[self._close_raw_col].iloc[idx])
-                if self._close_raw_col
-                else float(self.close.iloc[idx])
-            )
-            pos_entry = float(self.position["entry"])
-            pos_size = float(self.position["size"])
-            pos_risk = max(float(self.position.get("risk_amount", 1.0)), 1e-6)
-            cur_unreal = (
-                (close_cur - pos_entry) * pos_size
-                if self.position["dir"] == "LONG"
-                else (pos_entry - close_cur) * pos_size
-            )
-            cur_mfe = cur_unreal / pos_risk
+            cur_r = self._open_r(self._close_now(idx))
             self.position["max_favorable_excursion"] = max(
-                float(self.position.get("max_favorable_excursion", 0.0)), cur_mfe
+                float(self.position.get("max_favorable_excursion", 0.0)), cur_r
             )
-            # MAE: max loss seen (absolute value, always ≥ 0)  ← v2
-            # cur_unreal < 0 -> losing -> MAE grows
+            # MAE: max loss seen in R (always >= 0)
             self.position["max_adverse_excursion"] = max(
-                float(self.position.get("max_adverse_excursion", 0.0)),
-                -cur_unreal / pos_risk,  # positive when losing
+                float(self.position.get("max_adverse_excursion", 0.0)), -cur_r
             )
 
         # Check exit
@@ -1866,7 +1834,7 @@ class MarketEnv:
             if not self.position:
                 reward += self._hold_reward(idx)
 
-        # ✅ PPO DENSE REWARDS
+        # PPO DENSE REWARDS
         reward += self._mtm_reward(idx)
         if action == 0:
             reward += self._opportunity_cost_penalty(idx)
@@ -1880,14 +1848,9 @@ class MarketEnv:
             info["kill_reason"] = "bankruptcy"
             return self._get_state(), reward, done, info
 
-        if self.position is not None and self._close_raw_col:
-            close_cur = float(self.df[self._close_raw_col].iloc[idx])
-            pos_entry = float(self.position["entry"])
-            pos_size = float(self.position["size"])
-            unrealized = (
-                (close_cur - pos_entry) * pos_size
-                if self.position["dir"] == "LONG"
-                else (pos_entry - close_cur) * pos_size
+        if self.position is not None:
+            unrealized = self._open_r(self._close_now(idx)) * float(
+                self.position.get("risk_amount", 0.0)
             )
         else:
             unrealized = 0.0
@@ -1909,20 +1872,14 @@ class MarketEnv:
             # entry lockout: only Wed/Fri 20:30->21:30 + Sunday before 22:00
             time_force_close = self._is_time_force_close(idx)
             if time_force_close is not None:
-                close_force = (
-                    float(self.df[self._close_raw_col].iloc[idx])
-                    if self._close_raw_col
-                    else float(self.close.iloc[idx])
-                )
+                # market exit at the close, paying the spread
                 spread_raw = self._get_spread(idx)
-                entry = float(self.position["entry"])
-                size = float(self.position["size"])
-                pos_risk = max(float(self.position.get("risk_amount", 1.0)), 1e-6)
-                if self.position["dir"] == "LONG":
-                    raw_pnl = (close_force - spread_raw - entry) * size
-                else:
-                    raw_pnl = (entry - close_force - spread_raw) * size
-                rr_force = float(np.clip(raw_pnl / pos_risk, -3.0, 3.0))
+                sign = 1.0 if self.position["dir"] == "LONG" else -1.0
+                rr_force = float(
+                    np.clip(self._open_r(self._close_now(idx) - sign * spread_raw), -3.0, 3.0)
+                )
+                # the trade's result is part of the reward, as at the SL / TP
+                reward += rr_force
 
                 # v26+: force-close penalty — teaches the agent not to hold
                 # positions until the force close. Proportional to the lost RR.
@@ -1978,7 +1935,7 @@ class MarketEnv:
             if ob > 300:  # 300 × 15min = 75h ≈ 3 working days
                 reward -= self.exposure_penalty_per_bar * 0.3  # very soft vs the old -2.0
 
-        # ✅ Periodic Sharpe bonus
+        # Periodic Sharpe bonus
         reward += self._maybe_sharpe_bonus()
 
         # Track the bar return

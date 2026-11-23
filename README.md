@@ -18,9 +18,9 @@ I'm building it one module at a time. So far:
 
 | Module | Status |
 |---|---|
-| `data_management/` — download, features, scaling | ✅ here |
-| `encoder/` — multi-head encoder, bootstrap + walk-forward retrain | ✅ here |
-| `agent/` — Rainbow DQN agent, arbiter, walk-forward runs | ✅ here |
+| `data_management/` — download, features, scaling | here |
+| `encoder/` — multi-head encoder, bootstrap + walk-forward retrain | here |
+| `agent/` — Rainbow DQN agent, arbiter, walk-forward runs | here |
 | live / paper trading | coming next |
 
 ---
@@ -181,8 +181,11 @@ market features, time features and the open position (unrealized PnL, MFE/MAE, d
 SL/TP, bars held): `gru_hidden + 72` values, 200 with the default encoder.
 Five actions: HOLD, LONG / SHORT trend (RR 1.8) and LONG / SHORT mean reversion (RR 1.0), SL
 and TP in ATR units checked on the real 15min prices, spread, slippage on gaps, commissions and
-swaps. Positions are closed on Wednesday (triple swap) and Friday evening. The reward is the
-trade result in R plus a dense shaping (mark-to-market, Sharpe bonus, drawdown penalty).
+swaps. Positions are closed on Wednesday (triple swap) and Friday evening; the calendar
+(`agent/market_calendar.py`) follows the 17:00 New York rollover, so it moves one hour earlier
+in UTC in summer. Trade P&L is net of commissions and swaps. The reward is the trade result in
+R plus a dense shaping (potential-based mark-to-market, Sharpe bonus, drawdown penalty), clipped
+only at +-3 so the TP / SL ratio of each strategy is what the agent sees.
 
 **Agent** (`agent/rainbow.py`): Rainbow DQN — QR-DQN with 32 quantiles, Double DQN, dueling
 heads, noisy layers instead of epsilon, prioritized replay on a SumTree and N-step returns kept
@@ -260,6 +263,7 @@ encoder/
 agent/
     config.py        DEFAULT_CFG (env, arbiter, runner, Rainbow), RUN_CONFIGS, build_cfg
     env.py           MarketEnv: encoder state, SL/TP execution, costs, reward
+    market_calendar.py force close, entry lockout, swap rollover (New York time)
     rainbow.py       Rainbow DQN: QR-DQN, dueling, noisy layers, PER, per-asset N-step
     arbiter.py       TradeArbiter, Portfolio, MultiAssetRunner (filters, risk, kill switch)
     pipeline.py      walk-forward training / evaluation, joint runs, CLI

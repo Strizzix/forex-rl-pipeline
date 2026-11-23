@@ -29,6 +29,7 @@ from agent.env import (  # noqa: E402
     ensure_datetime_index_utc,
     load_encoder_from_checkpoint,
 )
+from agent.market_calendar import swap_days  # noqa: E402
 from agent.pipeline import (  # noqa: E402
     find_encoder_checkpoints,
     latest_agent_checkpoint,
@@ -508,3 +509,106 @@ def test_pipeline_cli_one_wf(data_root, models_root, tmp_path):
     assert summaries
     report = json.load(open(summaries[0]))["counterfactual"]
     assert "decisions" in report  # the agent's eval decisions replayed
+
+
+# ── Execution, P&L and calendar ───────────────────────────────────────────────
+
+
+def _bare_env(index, close, atr=0.001, spread=0.0, **cfg_kw):
+    """An env without encoder on a hand-made price path (only the trading mechanics)."""
+    close = np.asarray(close, dtype=float)
+    df = pd.DataFrame(
+        {
+            "close_15min_raw": close,
+            "high_15min_raw": close,
+            "low_15min_raw": close,
+            "ATR14_15min_raw": np.full(len(close), atr),
+            "spread_mean_15min_raw": np.full(len(close), spread),
+        },
+        index=index,
+    )
+    cfg = copy.deepcopy(DEFAULT_CFG["env_cfg"])
+    cfg.update({"device": "cpu", "seq_len": 4, "slippage_noise": 0.0, **cfg_kw})
+    env = MarketEnv(df, None, None, cfg)
+    env.reset(start_idx=4)
+    return env
+
+
+@pytest.mark.parametrize(
+    "day, close_utc, lockout_utc, rollover_utc",
+    [("2024-01-10", "21:30", "20:30", "22:00"), ("2024-07-10", "20:30", "19:30", "21:00")],
+)
+def test_calendar_follows_the_new_york_rollover(day, close_utc, lockout_utc, rollover_utc):
+    idx = pd.date_range(f"{day} 18:00", periods=24, freq="15min", tz="UTC")  # a Wednesday
+    hhmm = idx.strftime("%H:%M")
+    assert hhmm[force_close_mask(idx)][0] == close_utc
+    assert hhmm[entry_lockout_mask(idx)][0] == lockout_utc
+    swaps = swap_days(idx)
+    assert hhmm[swaps > 0].tolist() == [rollover_utc] and swaps.max() == 3.0  # Wednesday x3
+    # Friday in summer: the force close comes before the weekly close (21:00 UTC)
+    fri = pd.date_range("2024-07-12 19:00", periods=8, freq="15min", tz="UTC")
+    assert fri.strftime("%H:%M")[force_close_mask(fri)][0] == "20:30"
+
+
+def test_force_close_books_the_real_result_net_of_costs():
+    idx = pd.date_range("2024-07-10 18:00", periods=16, freq="15min", tz="UTC")
+    env = _bare_env(idx, np.linspace(1.0, 1.0015, 16))
+    env.step(1)  # long at 1.0004, SL 1 ATR = 0.0010 below
+    pos = dict(env.position)
+    for _ in range(10):
+        _, reward, _, info = env.step(0)
+        if env.position is None:
+            break
+    trade = env.episode_trades[-1]
+    assert info["closed_trade_result"] == "wednesday_swap"
+    assert trade["rr"] == pytest.approx(0.6, abs=1e-6)  # (1.0010 - 1.0004) / 0.0010
+    # the P&L is net of the commission; the reward carries the trade's R
+    assert trade["pnl"] == pytest.approx(0.6 * pos["risk_amount"] - pos["commission"])
+    assert reward > 0.4
+    assert env.balance == pytest.approx(env.initial_capital + trade["pnl"])
+
+
+def test_open_trade_features_are_in_r():
+    idx = pd.date_range("2024-01-08 10:00", periods=12, freq="15min", tz="UTC")
+    close = np.r_[np.full(5, 1.0), 1.0005, 1.0005, 0.9995, np.full(4, 0.9995)]
+    env = _bare_env(idx, close)
+    env.step(1)
+    env.step(0)  # +0.5 R
+    assert env.position["max_favorable_excursion"] == pytest.approx(0.5)
+    env.step(0)
+    env.step(0)  # -0.5 R
+    assert env.position["max_adverse_excursion"] == pytest.approx(0.5)
+    assert env._open_r(1.0005) == pytest.approx(0.5)
+
+
+def test_mtm_shaping_cancels_over_a_trade():
+    idx = pd.date_range("2024-01-08 10:00", periods=20, freq="15min", tz="UTC")
+    env = _bare_env(idx, np.ones(20), mtm_scale=1.0, gamma=1.0)
+    env.position = {"dir": "LONG", "entry": 1.0, "sl": 0.999, "tp": 1.002, "risk_dist": 0.001}
+    total = 0.0
+    for k, price in enumerate([1.0003, 1.0008, 0.9996, 1.0001]):
+        env.df.iloc[5 + k, env.df.columns.get_loc("close_15min_raw")] = price
+        total += env._mtm_reward(5 + k)
+    env.position = None
+    total += env._mtm_reward(9)
+    assert total == pytest.approx(0.0, abs=1e-12)
+
+
+def test_swap_is_charged_at_the_rollover():
+    idx = pd.date_range("2024-01-09 21:00", periods=8, freq="15min", tz="UTC")  # Tuesday
+    env = _bare_env(idx, np.ones(8))
+    env.reset(start_idx=1)
+    env.step(1)
+    balance = env.balance
+    for _ in range(5):
+        env.step(0)
+    assert env.position["swap_usd"] > 0  # held through 22:00 UTC (17:00 New York)
+    assert env.balance == pytest.approx(balance - env.position["swap_usd"])
+
+
+def test_reward_clip_keeps_the_trade_economics():
+    agent = RainbowAgent(STATE_DIM, _rainbow_cfg(), device="cpu")
+    s = np.zeros(STATE_DIM, dtype=np.float32)
+    agent.store(s, 1, 1.8, s, True, tag="tp", env_id="A")
+    agent.store(s, 3, -1.0, s, True, tag="sl", env_id="B")
+    assert sorted(agent.buffer._rewards[:2].tolist()) == pytest.approx([-1.0, 1.8])

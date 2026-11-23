@@ -425,19 +425,22 @@ class NStepBuffer:
         return ready
 
     def flush(self) -> list[tuple]:
-        """Releases the transitions still waiting (end of an episode without done)."""
+        """
+        Releases the transitions still waiting (the loop stopped without a done).
+        Fewer than n steps remain after them and the target bootstraps with gamma^n,
+        so they would get the wrong discount: only the ones that end in a done (no
+        bootstrap) are kept, the others (at most n - 1) are dropped.
+        """
         buf_list = list(self._buf)
         ready = []
         for i in range(len(buf_list)):
             s_i, a_i, _, _, _, tag_i, _ = buf_list[i]
             R = 0.0
-            actual_ns, actual_done, actual_mask = buf_list[-1][3], True, buf_list[-1][6]
             for j, (_, _, r_j, ns_j, d_j, _, m_j) in enumerate(buf_list[i:]):
                 R += (self.gamma**j) * r_j
-                actual_ns, actual_done, actual_mask = ns_j, d_j, m_j
                 if d_j:
+                    ready.append((s_i, a_i, R, ns_j, True, tag_i, m_j))
                     break
-            ready.append((s_i, a_i, R, actual_ns, actual_done, tag_i, actual_mask))
         self._buf.clear()
         return ready
 
@@ -539,12 +542,12 @@ class RainbowAgent:
     Rainbow DQN agent for multi-asset forex trading.
 
     Components:
-      ✅ Double DQN         — online picks the action, target evaluates it
-      ✅ Dueling Networks   — V(s) + A(s,a) to handle the dominant HOLD
-      ✅ QR-DQN             — 32 quantiles, asymmetric Huber loss
-      ✅ PER                — α=0.6, β annealing 0.4→1.0
-      ✅ N-step returns     — n=5, PER ASSET so sequences never mix
-      ✅ Noisy Networks     — adaptive exploration, no epsilon
+      - Double DQN         — online picks the action, target evaluates it
+      - Dueling Networks   — V(s) + A(s,a) to handle the dominant HOLD
+      - QR-DQN             — 32 quantiles, asymmetric Huber loss
+      - PER                — α=0.6, β annealing 0.4→1.0
+      - N-step returns     — n=5, PER ASSET so sequences never mix
+      - Noisy Networks     — adaptive exploration, no epsilon
 
     Config keys (rainbow_cfg in DEFAULT_CFG of pipeline.py):
         n_actions         — 3  (HOLD / LONG / SHORT)
@@ -562,7 +565,8 @@ class RainbowAgent:
         n_step            — 5
         target_update_tau — 0.005
         grad_clip         — 1.0
-        reward_clip       — 1.0  (0 = off)
+        reward_clip       — 3.0  (0 = off): per-step rewards clipped to [-neg x clip, clip]
+        reward_clip_neg   — 1.0  (fraction of reward_clip on the negative side)
         warmup_steps      — 2_000
     """
 
@@ -585,7 +589,8 @@ class RainbowAgent:
         self.n_step = int(cfg.get("n_step", 5))
         self.target_tau = float(cfg.get("target_update_tau", 0.005))
         self.grad_clip = float(cfg.get("grad_clip", 1.0))
-        self.reward_clip = float(cfg.get("reward_clip", 1.0))
+        self.reward_clip = float(cfg.get("reward_clip", 3.0))
+        self.reward_clip_neg = float(cfg.get("reward_clip_neg", 1.0))
         self.warmup_steps = int(cfg.get("warmup_steps", 2_000))
 
         hidden_dims = list(cfg.get("hidden_dims", [256, 256, 128]))
@@ -645,7 +650,7 @@ class RainbowAgent:
         # ── Internal state ───────────────────────────────────────────
         self._train_steps = 0
         self._eval_mode = False
-        self._freeze_until_step = 0  # ✅ avoids the getattr fallback in train_step
+        self._freeze_until_step = 0  # avoids the getattr fallback in train_step
 
         logger.info(
             "RainbowAgent | state_dim=%d | hidden=%s | n_quant=%d | "
@@ -784,12 +789,14 @@ class RainbowAgent:
                     target only looks at actions that could actually be taken there.
         """
         if self.reward_clip > 0:
-            # Asymmetric: positive rewards clipped at reward_clip (1.0),
-            # negative rewards clipped at -reward_clip * 0.5 (-0.5).
-            # Softens the "trading is always wrong" signal in bootstrap
-            # without removing it: SLs still give a negative signal,
-            # but don't flood the PER buffer with a fixed reward = -1.0.
-            reward = float(np.clip(reward, -self.reward_clip * 0.5, self.reward_clip))
+            # The clip must keep the trade economics: with the old [-0.5, 1.0] a TP of
+            # +1.8 R counted +1.0 and an SL of -1 R counted -0.5, so the agent saw a
+            # 1:1 MR trade as 2:1 and learned trades that lose money. The default
+            # [-3, 3] only cuts outliers (kill / bankruptcy penalties).
+            # reward_clip=1.0, reward_clip_neg=0.5 gives back the old clip.
+            reward = float(
+                np.clip(reward, -self.reward_clip * self.reward_clip_neg, self.reward_clip)
+            )
 
         s_np = self._to_numpy(state)
         ns_np = self._to_numpy(next_state)
@@ -798,7 +805,7 @@ class RainbowAgent:
         ready = nstep_buf.add(s_np, action, reward, ns_np, done, tag, next_mask)
 
         for s, a, r, ns, d, t, m in ready:
-            # ✅ clip the n-step return — the sum of n clipped rewards
+            # clip the n-step return — the sum of n clipped rewards
             # can reach reward_clip * n_step (e.g. 1.0 * 5 = 5.0)
             if self.reward_clip > 0:
                 r = float(
@@ -1190,4 +1197,4 @@ if __name__ == "__main__":
     assert len(agent._nstep_bufs) == 0
     print("  prepare_for_retrain: OK")
 
-    print("\n✅ RainbowAgent v2 — all checks passed")
+    print("\nRainbowAgent v2 — all checks passed")

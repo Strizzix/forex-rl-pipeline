@@ -37,8 +37,6 @@ DEFAULT_CFG: dict[str, Any] = {
     # v23: outcome head for the arbiter filter (0.0 = off)
     "use_outcome_head": True,
     # v25: encoder trained with n_assets=5 per class — asset embedding on
-    "n_assets_majors": 5,
-    "n_assets_minors": 5,
     # ── Walk-forward ───────────────────────────────────────────────────────
     # mode: "auto" (splits generated automatically) | "manual" (uses wf_splits)
     "wf_mode": "manual",
@@ -132,7 +130,11 @@ DEFAULT_CFG: dict[str, Any] = {
         "hold_reward_warmup_steps": 5000,
         "model_tf_order": ["15min", "30min", "1h", "4h", "1d"],
         # ── Dense reward ─────────────────────────────────────────────────
+        # mark-to-market: "delta" = potential-based (gamma * phi' - phi, phi = mtm_scale x
+        # open R): credit earlier in the trade, sums to ~0, the best policy is unchanged.
+        # "level" = mtm_scale x open R x decay every bar
         "mtm_reward_enabled": True,
+        "mtm_mode": "delta",
         "mtm_scale": 0.05,
         "opportunity_cost_enabled": True,
         "opportunity_cost_scale": 0.001,
@@ -255,7 +257,6 @@ DEFAULT_CFG: dict[str, Any] = {
             "persistence_min": 240,
         },
         "safety": {
-            "train_mode": True,
             "decision_gate": {"enabled": False},
             "kill_switch": {"enabled": False},
         },
@@ -283,7 +284,10 @@ DEFAULT_CFG: dict[str, Any] = {
         "n_step": 5,  # n-step returns
         "target_update_tau": 0.005,  # target soft update
         "grad_clip": 1.0,
-        "reward_clip": 1.0,
+        # per-step reward clip [-reward_clip * reward_clip_neg, reward_clip]: wide enough
+        # to keep TP (+rr) vs SL (-1) intact; 1.0 / 0.5 = the earlier [-0.5, 1.0]
+        "reward_clip": 3.0,
+        "reward_clip_neg": 1.0,
         "warmup_steps": 1000,  # steps before training starts
     },
     "log_every_steps": 5000,  # log the training metrics every N steps

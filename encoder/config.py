@@ -235,7 +235,7 @@ DEFAULT_CONFIG = {
     # the epoch choice but raised the score LEVEL by a fixed ~0.37. Now the weight
     # goes to what really discriminates; v28 dominates (it's what the live system
     # uses), regime stays as a guard on the backbone health.
-    # ⚠️ The score level changed: the 0.72-0.75 envelope and the 0.68 re-bootstrap
+    # Note: The score level changed: the 0.72-0.75 envelope and the 0.68 re-bootstrap
     # threshold must be rebuilt on the new runs.
     "score_w_trend": 0.25,
     "score_w_outcome": 0.0,  # v27: classic OutcomeHead off
@@ -262,7 +262,7 @@ DEFAULT_CONFIG = {
     # pre-retrain baseline: evaluates the anchor checkpoint on the new val period
     # BEFORE any training (pre_retrain_baseline_<tag>.json). ~1 min.
     "pre_retrain_baseline_eval": True,
-    # baseline score < (1 - threshold) -> ⚠️ DEGRADED in the log: the anchor
+    # baseline score < (1 - threshold) -> "DEGRADED" in the log: the anchor
     # checkpoint may be wrong or too old
     "baseline_degradation_threshold": 0.05,
     "bootstrap_train_start": "2014-01-01",

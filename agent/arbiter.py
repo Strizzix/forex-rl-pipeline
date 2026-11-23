@@ -448,7 +448,7 @@ class Portfolio:
         dsb = max(self.day_start_balance, 1e-8)
         self.daily_pnl_pct = (self.balance - dsb) / dsb
 
-        # ✅ FIX: daily_losses reset on the date, whatever the sign of the PnL
+        # daily_losses reset on the date, whatever the sign of the PnL
         today = timestamp.date() if timestamp is not None else None
         if today is not None and today != self._loss_day:
             self._loss_day = today
@@ -781,7 +781,7 @@ class MultiAssetRunner:
         self._allowed_max_trades = None
         self._entry_block = ""
         self.decision_log: list[dict] = []  # eval: the agent's trade decisions, for the report
-        self._daily_sl_warned_day = None  # ✅ explicit initialization
+        self._daily_sl_warned_day = None  # explicit initialization
         self.trades_opened_today = 0
 
         logger.info(
@@ -1272,7 +1272,7 @@ class MultiAssetRunner:
             self.trades_opened_today = 0
             self.portfolio.daily_losses = 0
             self.portfolio._loss_day = current_date
-            self.portfolio.daily_pnl_pct = 0.0  # ✅ explicit P&L% reset when the day changes
+            self.portfolio.daily_pnl_pct = 0.0  # explicit P&L% reset when the day changes
 
         # can the portfolio take one more trade at all? if not, every trade action is
         # masked: the agent sees HOLD as its only choice instead of being overruled
@@ -1754,15 +1754,23 @@ class MultiAssetRunner:
             pos = env.position
             if pos is not None and int(pos.get("entry_idx", -999)) == pre_step:
                 opened = True
+                # the trade keeps the rank it was approved with: the closing step's
+                # proposal is a HOLD whose rank says nothing about this trade
+                pos["entry_rank"] = prop.rank
 
             closed = False
             last_result = None
             last_pnl = 0.0
+            closed_rank = None
+            closed_strategy = None
             if len(env.episode_trades) > pre_trade_counts[asset]:
                 closed = True
                 last_trade = env.episode_trades[-1]
                 last_result = last_trade.get("result")
                 last_pnl = last_trade.get("pnl", 0.0)
+                closed_pos = getattr(env, "_last_closed_position", None) or {}
+                closed_rank = closed_pos.get("entry_rank")
+                closed_strategy = closed_pos.get("strategy", "trend")
 
             # Reward shaping
             scale = (
@@ -1787,9 +1795,9 @@ class MultiAssetRunner:
                 # It doesn't reward the rank itself, it teaches that the top-ranked
                 # ones should be preferred and the low-ranked ones cost when they fail.
                 if self.mode == "train":
-                    if prop.rank == 0 and result_tp:
+                    if closed_rank == 0 and result_tp:
                         shaped_reward += 0.03 * scale
-                    elif prop.rank is not None and prop.rank >= 2 and result_sl:
+                    elif closed_rank is not None and closed_rank >= 2 and result_sl:
                         shaped_reward -= 0.03 * scale
 
             if not prop.approved and prop.action != 0:
@@ -1814,17 +1822,17 @@ class MultiAssetRunner:
                 result_tp = last_result == "tp"
                 result_sl = last_result == "sl"
                 # ── Rank tracking (rank0=best, rank1=second, rank2=third) ──
-                if prop.rank == 0:
+                if closed_rank == 0:
                     if result_tp:
                         self.arbiter_stats["rank1_tp"] += 1
                     elif result_sl:
                         self.arbiter_stats["rank1_sl"] += 1
-                elif prop.rank == 1:
+                elif closed_rank == 1:
                     if result_tp:
                         self.arbiter_stats["rank2_tp"] += 1
                     elif result_sl:
                         self.arbiter_stats["rank2_sl"] += 1
-                elif prop.rank == 2:
+                elif closed_rank == 2:
                     if result_tp:
                         self.arbiter_stats["rank3_tp"] += 1
                     elif result_sl:
@@ -1845,7 +1853,7 @@ class MultiAssetRunner:
                     elif result_sl:
                         self.arbiter_stats[f"{key}_sl"] += 1
                 # ── Strategy tracking (trend vs MR) ───────────────────────
-                strategy = getattr(prop, "strategy_type", "trend")
+                strategy = closed_strategy or "trend"
                 if result_tp:
                     self.arbiter_stats[f"{strategy}_tp"] += 1
                 elif result_sl:
@@ -1859,6 +1867,7 @@ class MultiAssetRunner:
                 "done": done,
                 "info": info,
                 "proposal": prop,
+                "closed_rank": closed_rank,
                 "is_ppo": False,
                 "rollout_step": None,
             }
@@ -1894,7 +1903,7 @@ class MultiAssetRunner:
                     # at +8% and drop to +2% -> trailing=6% but absolute DD=0% -> no block
                     if abs_breach and not self.block_new_trades:
                         logger.error(
-                            "⚠️ CRITICAL: absolute DD breach → BLOCK. Abs=%.4f (limit=%.4f) Trail=%.4f",
+                            "CRITICAL: absolute DD breach → BLOCK. Abs=%.4f (limit=%.4f) Trail=%.4f",
                             self.portfolio.drawdown,
                             self.BASELINE_MAX_DD,
                             self.portfolio.drawdown_trailing,
@@ -1902,9 +1911,7 @@ class MultiAssetRunner:
                         self.block_new_trades = True
                     elif self.block_new_trades:
                         if self.portfolio.drawdown < self.BASELINE_MAX_DD * 0.70:
-                            logger.info(
-                                "✅ RECOVERY: absolute DD < 70%% of baseline → RE-ENABLING."
-                            )
+                            logger.info("RECOVERY: absolute DD < 70%% of baseline → RE-ENABLING.")
                             self.block_new_trades = False
 
                 else:
@@ -1977,6 +1984,9 @@ class MultiAssetRunner:
             env = self.envs[asset]
             ns, r, done, info = env.step(0, external_risk_amount=None)
             info = info or {}
+            closed_rank = None
+            if len(env.episode_trades) > pre_counts[asset]:
+                closed_rank = (getattr(env, "_last_closed_position", None) or {}).get("entry_rank")
             # stored in the replay by the training loop like every other transition
             transitions[asset] = {
                 "state": prop.state,
@@ -1986,6 +1996,7 @@ class MultiAssetRunner:
                 "done": done,
                 "info": info,
                 "proposal": prop,
+                "closed_rank": closed_rank,
                 "is_ppo": False,
                 "rollout_step": None,
                 "next_mask": self._next_mask(env),

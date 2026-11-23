@@ -93,7 +93,7 @@ def set_global_seed(seed: int = 42, deterministic: bool = True, full_determinism
       weights and same data order between baseline and new.
 
     full_determinism=True: also torch.use_deterministic_algorithms + CUBLAS
-      workspace. ⚠️ VERY SLOW (can be 10× or more: some deterministic kernels
+      workspace. VERY SLOW (can be 10× or more: some deterministic kernels
       fall back to slow implementations or the CPU). NOT needed for the A/B
       comparison — it only removes ~1e-6 floating-point differences, irrelevant
       when comparing AUCs. Leave it False unless you need bit-for-bit
@@ -1893,13 +1893,13 @@ def train_pretrainer_with_contrastive(conf: dict[str, Any]):
     _di_avail_tfs = [tf for tf, ok in _di_avail_by_tf.items() if ok]
     if _di_missing_tfs:
         logger.warning(
-            "[DI DIR] ⚠️  di_direction NOT available for TFs: %s  "
+            "[DI DIR] WARNING: di_direction NOT available for TFs: %s  "
             "(DI_plus14/DI_minus14 missing from parquet — re-download with updated downloader). "
             "RegimeContinuousHead slot[3] will train on NaN targets for these TFs.",
             _di_missing_tfs,
         )
     if _di_avail_tfs:
-        logger.info("[DI DIR] ✅ di_direction available for TFs: %s", _di_avail_tfs)
+        logger.info("[DI DIR] OK di_direction available for TFs: %s", _di_avail_tfs)
     # ────────────────────────────────────────────────────────────────────────
 
     n_tfs = len(TF_LIST)
@@ -2628,7 +2628,7 @@ def train_pretrainer_with_contrastive(conf: dict[str, Any]):
             _bl_deg = float(conf.get("baseline_degradation_threshold", 0.05))
             if _bl_deg > 0 and _bl_score < (1.0 - _bl_deg):
                 logger.warning(
-                    "[PRE-RETRAIN BASELINE] ⚠️  DEGRADED score=%.4f < %.2f — "
+                    "[PRE-RETRAIN BASELINE] WARNING: DEGRADED score=%.4f < %.2f — "
                     "check anchor checkpoint quality.",
                     _bl_score,
                     1.0 - _bl_deg,
@@ -2960,7 +2960,7 @@ def train_pretrainer_with_contrastive(conf: dict[str, Any]):
                             else torch.tensor(_sr, device=device)
                         ).float()
                         _vs = _sy >= 0
-                        # ⚠️ strat_cnf_* is a Python float: the collate makes it
+                        # Note: strat_cnf_* is a Python float: the collate makes it
                         # a CPU tensor. Without .to(device), indexing with a
                         # CUDA mask raised an error that the surrounding try/
                         # except swallowed, zeroing the loss: the head got
@@ -2984,7 +2984,7 @@ def train_pretrainer_with_contrastive(conf: dict[str, Any]):
                     # negative correlation.
                     _w_af = float(conf.get("w_antiphase", 0.0))
                     # ALWAYS measure, CORRECT only if the weight is > 0.
-                    # ⚠️ The computation used to be nested inside `if _w_af > 0`,
+                    # Note: The computation used to be nested inside `if _w_af > 0`,
                     # so with w_antiphase=0 (the default) it never ran and the
                     # metrics stayed nan — the opposite of the intent: at zero
                     # weight the measure is PURE, and that's exactly when you need
@@ -3362,10 +3362,10 @@ def train_pretrainer_with_contrastive(conf: dict[str, Any]):
         )
 
         if monitor_alerts:
-            logger.warning("[TREND MONITOR] ⚠️  ep=%d alerts=%s", epoch, monitor_alerts)
+            logger.warning("[TREND MONITOR] WARNING: ep=%d alerts=%s", epoch, monitor_alerts)
         else:
             logger.info(
-                "[TMOM MONITOR] ✅ ep=%d | %s",
+                "[TMOM MONITOR] OK ep=%d | %s",
                 epoch,
                 " | ".join(
                     f"{tf}: mean={epoch_trend_monitor.get(f'tmom_mean_{tf}', float('nan')):+.3f} "
@@ -3420,7 +3420,7 @@ def train_pretrainer_with_contrastive(conf: dict[str, Any]):
         logger.info(
             "[RETRAIN SAFE] ep=%d -> %s%s",
             epoch,
-            "✅ YES" if retrain_safe else "⚠️  NO",
+            "YES" if retrain_safe else "NO",
             f" ({', '.join(retrain_safe_reasons)})" if retrain_safe_reasons else "",
         )
 
@@ -3441,9 +3441,9 @@ def train_pretrainer_with_contrastive(conf: dict[str, Any]):
                 current_emb_stats, baseline_emb_stats, drift_threshold
             )
             if drift_detected:
-                logger.warning("[STRUCTURAL DRIFT] ⚠️  ep=%d", epoch)
+                logger.warning("[STRUCTURAL DRIFT] WARNING: ep=%d", epoch)
             else:
-                logger.info("[STRUCTURAL DRIFT] ✅ ep=%d", epoch)
+                logger.info("[STRUCTURAL DRIFT] OK ep=%d", epoch)
 
         regime_drift_detected = False
         regime_drift_report = {}
@@ -3462,9 +3462,9 @@ def train_pretrainer_with_contrastive(conf: dict[str, Any]):
                     rolling_stats, previous_regime_stats, regime_drift_threshold
                 )
                 if regime_drift_detected:
-                    logger.warning("[REGIME DRIFT] ⚠  ep=%d (save NOT blocked)", epoch)
+                    logger.warning("[REGIME DRIFT] WARNING: ep=%d (save NOT blocked)", epoch)
                 else:
-                    logger.info("[REGIME DRIFT] ✅ ep=%d", epoch)
+                    logger.info("[REGIME DRIFT] OK ep=%d", epoch)
             previous_regime_stats = rolling_stats
 
         skip_save = live_mode and drift_detected
@@ -3542,7 +3542,7 @@ def train_pretrainer_with_contrastive(conf: dict[str, Any]):
                     )
                     if _emb_std < 0.01:
                         logger.warning(
-                            "[EMB DIAG] ⚠️ EMBEDDING COLLAPSE ep=%d std=%.6f", epoch, _emb_std
+                            "[EMB DIAG] WARNING: EMBEDDING COLLAPSE ep=%d std=%.6f", epoch, _emb_std
                         )
                 except Exception as _ediag_e:
                     logger.warning("[EMB DIAG] failed: %s", _ediag_e)
@@ -3948,7 +3948,7 @@ def train_pretrainer_with_contrastive(conf: dict[str, Any]):
                 )
             else:
                 logger.warning(
-                    "[DI DIR] ep=%d ⚠️  NO di_direction data — "
+                    "[DI DIR] ep=%d WARNING: NO di_direction data — "
                     "all NaN (DI_plus14/DI_minus14 missing from parquet). "
                     "Re-download with updated downloader and restart.",
                     epoch,
@@ -4084,7 +4084,7 @@ def train_pretrainer_with_contrastive(conf: dict[str, Any]):
                 )
             ]
             # ── COVERAGE PER LEG, with the AUC OF THE LEG ─────────────────
-            # ⚠️ Fix of a subtle flaw: the GROUP AUC used to be paired
+            # Note: Fix of a subtle flaw: the GROUP AUC used to be paired
             # (v28_pdhl_hit_auc = equal-weight mean of long and short) with
             # the count of a SINGLE leg. The comment said "each head weighted
             # by its own coverage", but the AUC going in was already the mean:
@@ -4188,7 +4188,7 @@ def train_pretrainer_with_contrastive(conf: dict[str, Any]):
                 live_mode,
                 val_start,
                 val_end,
-                "✅" if retrain_safe else "⚠️",
+                "OK" if retrain_safe else "WARN",
             )
 
             _extra_val = {
@@ -4236,7 +4236,7 @@ def train_pretrainer_with_contrastive(conf: dict[str, Any]):
                             "[BOOTSTRAP] BEST ep=%d score=%.6f retrain_safe=%s",
                             epoch,
                             score,
-                            "✅" if retrain_safe else "⚠️",
+                            "OK" if retrain_safe else "WARN",
                         )
                         # In bootstrap current_emb_stats={} — compute drift stats now
                         if current_emb_stats:
@@ -4470,9 +4470,9 @@ def train_pretrainer_with_contrastive(conf: dict[str, Any]):
                     logger.info(
                         "[LIVE] ep=%d structural=%s regime=%s safe=%s",
                         epoch,
-                        "✅" if not drift_detected else "⚠️",
-                        "⚠️" if regime_drift_detected else "✅",
-                        "✅" if retrain_safe else "⚠️",
+                        "OK" if not drift_detected else "WARN",
+                        "WARN" if regime_drift_detected else "OK",
+                        "OK" if retrain_safe else "WARN",
                     )
                 last_clean_live_epoch = epoch
             else:

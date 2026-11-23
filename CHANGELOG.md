@@ -9,6 +9,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Breaking
+- `agent`, reward and state (agents must be trained again): the per-step reward clip is now
+  `[-3, 3]` instead of `[-0.5, 1.0]`. The old clip turned a +1.8 R take profit into +1.0 and a
+  -1 R stop into -0.5, so a 1:1 MR trade looked like 2:1 and anything above a 33% win rate looked
+  profitable; `reward_clip: 1.0, reward_clip_neg: 0.5` gives it back. The open-trade state
+  features (unrealized R, MFE, MAE) and `bars_to_force_close` now carry real values (see Fixed).
+  **(AI-assisted)**
 - Rows are now labelled at the bar **close** time (the row `10:15` holds the bar `[10:00, 10:15)`),
   so a timestamp is the moment its data is known and downstream code can't take a 15-minute
   look-ahead by mistake. Higher TFs are close-labelled as well (no more `shift(1)`) and reach the
@@ -36,6 +42,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   picks among the available actions only. **(AI-assisted)**
 
 ### Added
+- `agent/market_calendar.py`: force close, entry lockout and swap rollover in New York time,
+  shared by the env and the strategy-head labels. **(AI-assisted)**
+- `agent`: a WF stops with an error if its test period starts before the end of the encoder's
+  training data (`train_end` in the checkpoint), i.e. if the results would be in-sample for the
+  encoder. **(AI-assisted)**
 - `agent/diagnostics.py`: `counterfactual` report in every eval / val summary — each trade the
   agent wanted, replayed with the env rules (mean R, win rate) per stage that stopped it and
   per entry-filter verdict, computed also with the filters off. **(AI-assisted)**
@@ -102,6 +113,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   indicators), also copied to the scaled parquet. **(AI-assisted)**
 
 ### Changed
+- `agent`: the mark-to-market reward is potential-based (`mtm_mode: "delta"`,
+  gamma x phi' - phi with phi = `mtm_scale` x open R): it moves credit earlier in the trade, sums
+  to ~0 over it and can't change which policy is best. `mtm_mode: "level"` is the documented
+  per-bar formula. With the unit bug below the MTM reward was ~0 in every earlier run.
+  **(AI-assisted)**
+- `agent`: trade P&L in the stats, eval summaries and portfolio is net of commission and swaps
+  (they were taken from the env balance only, so the reported results left them out).
+  **(AI-assisted)**
+- Emoji markers removed from code comments and log lines. **(AI-assisted)**
 - `encoder`: a checkpoint that doesn't load strictly is still loaded with `strict=False`, but
   now with a warning instead of silently. **(AI-assisted)**
 - `scale`: scalers come from the indicator registry instead of a separate name table (same choice
@@ -117,6 +137,38 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   **(AI-assisted)**
 
 ### Fixed
+- `agent`, P&L units: the open trade was valued as price difference x lots, missing the
+  pip value / pip size factor (~1e5): unrealized P&L, MFE / MAE, the MTM reward and the equity
+  used for the daily drawdown were all ~0, and **force-closed trades were booked at ~0 R**
+  whatever the price did. Everything is now in R (price move / entry-to-SL distance), the same
+  accounting as the SL / TP exits. **(AI-assisted)**
+- `agent`, force close: the trade's result was not part of the reward (only the small
+  force-close penalty, and only on winners), so carrying a loser into the Wednesday / Friday
+  close cost nothing. **(AI-assisted)**
+- `agent`, calendar in summer: force close, lockouts and swap were fixed UTC times written for
+  winter. From March to November the Friday 21:30 UTC force close came after the weekly close
+  (17:00 New York = 21:00 UTC): Friday positions were held over the weekend; the Wednesday close
+  came after the triple swap. Now in New York time. **(AI-assisted)**
+- `agent`, swap: charged only on a row stamped exactly 22:00 (and also on the bar a trade was
+  opened at); now on every rollover a position is held through. **(AI-assisted)**
+- `agent`, spread: the time-of-day multiplier (Sunday reopen x3.5, rollover x2.5, Asia x1.3)
+  never ran — `_spread_time_multiplier` lacked `@staticmethod`, the call raised and a
+  `try/except` used 1.0. A missing spread value was free (0) instead of `default_spread`.
+  **(AI-assisted)**
+- `agent`: MR positions were sized with the trend SL multiple, so their commission was off.
+  **(AI-assisted)**
+- `agent`, closed trades: the PER / elite tags (`rank1_tp`...), the rank shaping and the
+  per-rank / per-strategy stats used the rank and strategy of the **closing** step's proposal
+  — a HOLD whose rank depended on the other assets — instead of the trade's own. The trade now
+  keeps its entry rank and strategy. Force closes were counted and tagged as SL; now `other`.
+  **(AI-assisted)**
+- `agent`, settings that never reached the code: `mtm_reward_enabled`,
+  `opportunity_cost_enabled` and `opportunity_cost_scale` (the env read `opp_cost_scale` and used
+  its 0.002 default instead of 0.001); `n_assets_majors` / `n_assets_minors` and
+  `safety.train_mode` removed (unused). **(AI-assisted)**
+- `agent`, N-step: transitions flushed when the loop stops had fewer than n steps but were
+  bootstrapped with gamma^n; only the ones ending in a done are kept now (at most n - 1 per asset
+  dropped). **(AI-assisted)**
 - `agent`: settings that never reached the code: `train_filter_scale`, `adx_ranging_max`,
   `brk_min_mr` and `trend_train_bonus` were in `runner_cfg` but read from `arbiter_cfg` (the
   "filters at 40% / 100% in training" of Run2 / Run3 never applied: training was always

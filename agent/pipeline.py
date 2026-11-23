@@ -496,19 +496,21 @@ def _rainbow_train_loop(
             info = tr.get("info", {}) or {}
             tag = "hold"
             if info.get("closed_trade_result") is not None:
-                result = "tp" if info["closed_trade_result"] == "tp" else "sl"
+                # the force closes (Wednesday / Friday) are neither TP nor SL: "other"
+                result = info["closed_trade_result"]
+                if result not in ("tp", "sl"):
+                    result = "other"
                 if result == "tp":
                     _trades_tp += 1
-                else:
+                elif result == "sl":
                     _trades_sl += 1
                 # ── rank-aware tags for the elite buffer and the PER boost ──
-                # prop.rank is 0-indexed (rank=0 -> rank1, rank=1 -> rank2, rank=2 -> rank3)
-                # the "rank1_tp", "rank1_sl", ... tags turn on automatically:
+                # rank of the closed trade when it was approved (0-indexed: 0 -> "rank1"),
+                # not the rank of this step's HOLD. The tags turn on:
                 #   - PER priority boost via _TAG_PRIORITY_MULT in PrioritizedReplayBuffer
                 #   - the elite buffer insert in agent.store()
-                prop_r = tr.get("proposal")
-                _rank = getattr(prop_r, "rank", None)
-                if _rank is not None and _rank <= 1:  # rank 0 or 1 = rank1/rank2
+                _rank = tr.get("closed_rank")
+                if result != "other" and _rank is not None and _rank <= 1:
                     tag = f"rank{_rank + 1}_{result}"  # "rank1_tp", "rank2_sl", ...
                 else:
                     tag = result  # "tp" / "sl" base for rank3+
@@ -620,6 +622,25 @@ def _eval_loop(
 # ============================================================
 # MAIN WALK-FORWARD
 # ============================================================
+
+
+def _check_encoder_window(encoder, test_start, wf_name: str) -> None:
+    """Stops a WF whose test period overlaps the encoder's training data: the results
+    would be in-sample for the encoder."""
+    train_end = getattr(encoder, "train_end", None)
+    if train_end is None or str(train_end) in ("", "None"):
+        return
+    end = pd.Timestamp(train_end)
+    end = end.tz_localize("UTC") if end.tzinfo is None else end.tz_convert("UTC")
+    if len(str(train_end)) <= 10:  # a date: the whole day was training data
+        end = end + pd.Timedelta(days=1)
+    start = pd.Timestamp(test_start)
+    start = start.tz_localize("UTC") if start.tzinfo is None else start.tz_convert("UTC")
+    if start < end:
+        raise ValueError(
+            f"{wf_name}: test starts {start.date()} but the encoder was trained up to "
+            f"{train_end}; use the encoder of an earlier WF (encoder_wf_key)"
+        )
 
 
 def run_walk_forward_for_asset_map(
@@ -809,6 +830,7 @@ def run_walk_forward_for_asset_map(
         # load the right encoder for this WF (Bootstrap uses key=0)
         _enc_tuple = _get_encoder_for_wf(wf_idx, enc_key)
         encoder, emb_dim, regime_head, trend_head, vol_head, outcome_head = _enc_tuple[:6]
+        _check_encoder_window(encoder, test_start, wf_name)
         tmh = _enc_tuple[6] if len(_enc_tuple) > 6 else None
         rch = _enc_tuple[7] if len(_enc_tuple) > 7 else None
         msh = _enc_tuple[8] if len(_enc_tuple) > 8 else None
@@ -846,6 +868,8 @@ def run_walk_forward_for_asset_map(
                     continue
 
                 env_cfg = cfg.get("env_cfg", DEFAULT_CFG["env_cfg"]).copy()
+                # the MTM shaping discounts with the agent's gamma
+                env_cfg.setdefault("gamma", cfg.get("rainbow_cfg", {}).get("gamma", 0.99))
                 tm = cfg.get("training_mode", "full")
                 env_cfg["training_mode"] = (
                     "train" if tm in ("full", "retrain", "train", "scratch") else tm
@@ -1315,8 +1339,8 @@ def _merge_agents(agent_M, agent_m, state_dim: int, cfg: dict[str, Any], alpha: 
     """
     joint = _make_agent(state_dim, cfg)
 
-    sd_M = agent_M.online.state_dict()  # ✅
-    sd_m = agent_m.online.state_dict()  # ✅
+    sd_M = agent_M.online.state_dict()
+    sd_m = agent_m.online.state_dict()
     merged = {}
     for k in sd_M:
         if sd_M[k].dtype.is_floating_point:
@@ -1324,8 +1348,8 @@ def _merge_agents(agent_M, agent_m, state_dim: int, cfg: dict[str, Any], alpha: 
         else:
             merged[k] = sd_M[k]
 
-    joint.online.load_state_dict(merged, strict=True)  # ✅
-    joint.target.load_state_dict(merged, strict=True)  # ✅
+    joint.online.load_state_dict(merged, strict=True)
+    joint.target.load_state_dict(merged, strict=True)
     logger.info(
         "[MERGE] Joint agent created: alpha=%.2f (Majors) + %.2f (Minors)", alpha, 1.0 - alpha
     )
@@ -1457,6 +1481,8 @@ def run_walk_forward_joint(
         enc_m = _get_enc(minors_encoder_ckpt, enc_key)
         encoder_M, _edim_M = enc_M[0], enc_M[1]
         encoder_m, _edim_m = enc_m[0], enc_m[1]
+        _check_encoder_window(encoder_M, test_start, wf_name)
+        _check_encoder_window(encoder_m, test_start, wf_name)
         rh_M, th_M, vh_M, oh_M = enc_M[2], enc_M[3], enc_M[4], enc_M[5]
         rh_m, th_m, vh_m, oh_m = enc_m[2], enc_m[3], enc_m[4], enc_m[5]
         tmh_M = enc_M[6] if len(enc_M) > 6 else None
@@ -1497,6 +1523,8 @@ def run_walk_forward_joint(
                         continue
 
                     env_cfg = cfg.get("env_cfg", DEFAULT_CFG["env_cfg"]).copy()
+                    # the MTM shaping discounts with the agent's gamma
+                    env_cfg.setdefault("gamma", cfg.get("rainbow_cfg", {}).get("gamma", 0.99))
                     tm = cfg.get("training_mode", "full")
                     env_cfg["training_mode"] = (
                         "train" if tm in ("full", "retrain", "train", "scratch") else tm

@@ -47,6 +47,7 @@ from .env import (
     ensure_datetime_index_utc,
     load_encoder_from_checkpoint,
 )
+from .market_calendar import entry_lockout_mask, force_close_mask
 
 logger = logging.getLogger(__name__)
 
@@ -67,25 +68,6 @@ DEFAULTS = {
 
 
 # ── labels ────────────────────────────────────────────────────────────────────
-
-
-def _hm_dow(index: pd.DatetimeIndex):
-    idx = index.tz_convert("UTC")
-    return idx.hour.values * 60 + idx.minute.values, idx.dayofweek.values
-
-
-def force_close_mask(index: pd.DatetimeIndex) -> np.ndarray:
-    """Bars where MarketEnv force-closes: Wednesday / Friday from 21:30 UTC, Saturday."""
-    hm, dow = _hm_dow(index)
-    return (dow == 5) | ((dow == 4) & (hm >= 21 * 60 + 30)) | ((dow == 2) & (hm >= 21 * 60 + 30))
-
-
-def entry_lockout_mask(index: pd.DatetimeIndex) -> np.ndarray:
-    """Bars where MarketEnv opens nothing (Wed / Fri 20:30+, Sunday before 22:00, Saturday)."""
-    hm, dow = _hm_dow(index)
-    return (
-        (dow == 5) | ((dow == 6) & (hm < 22 * 60)) | (np.isin(dow, (2, 4)) & (hm >= 20 * 60 + 30))
-    )
 
 
 def trade_labels(
