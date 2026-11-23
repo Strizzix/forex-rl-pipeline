@@ -15,7 +15,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   grid one bar earlier, still without look-ahead. Existing datasets are rebuilt automatically by
   the next `update`; scale them again with `--refit`. **(AI-assisted)**
 
+- `agent`: aligned with the current encoder (see Fixed). The state is now `gru_hidden + 72`
+  values (200 with the default encoder, was 204) and the agent needs the encoder checkpoints
+  with the strategy head (`python -m agent.strategy_head`); agents trained before must be
+  trained again. **(AI-assisted)**
+
 ### Added
+- `agent/strategy_head.py`: the agent's `StrategyOutcomeHead` (P(hit) and P(TP first) of TREND /
+  MR x LONG / SHORT) trained on top of each frozen encoder checkpoint, with labels made by the
+  env's own trade rules, on the checkpoint's training window (early stopping on its validation
+  window). Writes `<models>/Encoder/<class>/Agent/<run>/encoder_agent.pth`, which the agent
+  pipeline now reads; the encoder's own checkpoints and the PDHL heads are untouched.
+  `StrategyOutcomeHead` is in `encoder.components` (v26 parameter names). **(AI-assisted)**
+- `encoder`: checkpoints store `extra["inputs"]` (feature columns, session / structural flags,
+  structural statistics per asset, asset map, TFs, `seq_len`), and
+  `encoder.dataset.encoder_input_matrix` rebuilds the exact input from a parquet; session and
+  structural features are module functions shared with the agent. Training unchanged (same
+  weights, checked bit for bit). **(AI-assisted)**
 - `agent/`: the Rainbow DQN trading agent, moved in from the research scripts `env_fx.py`,
   `agent_rainbow.py`, `arbiter.py`, `main_pipeline_ppo.py`: package layout, the configuration
   (`DEFAULT_CFG`, `RUN_CONFIGS`) in `agent/config.py`, a CLI (`python -m agent.pipeline --run ...`)
@@ -81,6 +97,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   **(AI-assisted)**
 
 ### Fixed
+- `agent`: the env read the encoder differently from how it was trained — its own copy of the
+  encoder, heads rebuilt from the `state_dict` shapes (trend without `tanh * 3`, DI direction
+  through `softplus`, so never negative: DI gates and bonuses broken), columns in parquet order
+  instead of the encoder's order, its own session features on the row time, no structural
+  features, `seq_len` 128 against 256. It now uses `encoder.components`, the input saved in the
+  checkpoint (`encoder_input_matrix`), the encoder's `seq_len` and asset ids, and stops on a
+  feature-count mismatch instead of padding / truncating. **(AI-assisted)**
+- `agent`: Wednesday / Friday force close, the entry lockouts, the overnight swap and the spread
+  by session hour never ran: they read `dayofweek` on Python datetimes, the error was swallowed
+  and treated as "no rule". **(AI-assisted)**
+- `agent`: the spread column was `spread_mean_15m_raw` (the data has `spread_mean_15min_raw`), so
+  every trade paid the fixed 1-pip fallback and the spread state feature was 0; the four
+  `delta_*` state features read columns that don't exist (always 0) and are dropped.
+  **(AI-assisted)**
+- `agent`: the environments were created before the seeds were set (their reset draws random
+  start points), so two runs with the same seed differed. **(AI-assisted)**
 - `agent`: `TradeArbiter.passes_entry_filter` was called by the runner but no longer existed
   (the scripts crashed at the first proposal); it is back, as `entry_filter_reason(...) == "pass"`.
   **(AI-assisted)**
@@ -142,23 +174,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   labels and the backtest will no longer match.
 
 ### Suggested, not applied
-- **Agent vs encoder** — needed before training the agent on the new data: **(AI-assisted review)**
-  - the environment needs a `StrategyOutcomeHead` (`strategy_outcome_head_state`); the current
-    encoder saves session / PDHL / regime-quality heads instead, so 12 state features become
-    constants and the arbiter's P(TP) bonuses are lost;
-  - `env.py` rebuilds the heads from the `state_dict` with generic layers: the trend head loses
-    its `tanh * 3` and the regime head puts `softplus` on DI direction, which can no longer be
-    negative (DI gates and bonuses broken). The env should import the heads from
-    `encoder.components`;
-  - input columns: the env uses the parquet order and its own session features (on the row
-    timestamp); the encoder groups the columns by TF and computes sessions on the bar open
-    time. Both should call the same function from `encoder.dataset`;
-  - column names: `spread_col` is `spread_mean_15m_raw` but the data has
-    `spread_mean_15min_raw` (spread feature always 0); the `delta_*` columns don't exist;
-  - the agent and the encoder share `<models>/Encoder/<class>/Checkpoint`: an encoder for the
-    agent and the PDHL one need separate folders;
-  - the environments are created before the random seeds are set, so two runs with the same
-    seed differ; seed at the start of `run_pipeline`.
 - **License**: the repository has no `LICENSE` file; without one, nobody else may legally reuse the
   code. **(AI-assisted review)**
 - **Encoder, spread and costs**: the strategy labels use mid prices with no spread; a long stop

@@ -186,6 +186,11 @@ def test_trainer_smoke(data_root, tmp_path, struct):
     assert ckpt.exists() and (out / "best_encoder_only.pth").exists()
     state = torch.load(ckpt, map_location="cpu", weights_only=False)
     assert state["extra"]["training_mode"] == "bootstrap"
+    # what the trading agent needs to rebuild the exact input
+    inputs = state["extra"]["inputs"]
+    assert inputs["use_structural_features"] == struct and inputs["seq_len"] == 32
+    assert set(inputs["structural_stats"]) == ({"EURUSD", "GBPUSD"} if struct else set())
+    assert sorted(inputs["asset_map"]) == ["EURUSD", "GBPUSD"]
     # the checkpoint loads strictly into freshly built modules (state_dict names unchanged)
     n_in = (
         state["encoder_state"]["tcn.network.0.conv1.weight"].shape[1] - 8

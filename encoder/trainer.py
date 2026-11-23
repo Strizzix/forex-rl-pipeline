@@ -3470,6 +3470,18 @@ def train_pretrainer_with_contrastive(conf: dict[str, Any]):
         skip_save = live_mode and drift_detected
 
         _extra_base = {
+            # what a consumer of the checkpoint (the trading agent) needs to rebuild
+            # the exact input: dataset.encoder_input_matrix(df, **inputs-subset)
+            "inputs": {
+                "feature_cols": list(collected_feature_cols),
+                "use_session_features": bool(conf.get("use_session_features", True)),
+                "use_structural_features": bool(conf.get("use_structural_features", False)),
+                "structural_stats": structural_stats_by_asset,
+                "asset_map": dict(asset_map),
+                "tf_list": list(TF_LIST),
+                "seq_len": int(seq_len),
+                "score_offset": int(conf.get("score_offset", 1)),
+            },
             "training_mode": training_mode,
             "live_mode": live_mode,
             "version_tag": version_tag,

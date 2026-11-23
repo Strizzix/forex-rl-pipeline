@@ -127,7 +127,7 @@ DEFAULT_CFG: dict[str, Any] = {
         "max_trades_per_day": 5,
         "max_dd": 0.30,
         "daily_dd_limit": 0.08,
-        "spread_col": "spread_mean_15m_raw",
+        "spread_col": "spread_mean_15min_raw",
         "tz_local": "Europe/Rome",
         "device": "cuda",
         "slippage_noise": 0.1,

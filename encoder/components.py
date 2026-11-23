@@ -684,6 +684,100 @@ class BEReachableHead(nn.Module):
         return torch.sigmoid(ll).squeeze(-1), torch.sigmoid(ls).squeeze(-1)
 
 
+class StrategyOutcomeHead(nn.Module):
+    """
+    Outcome of the trading agent's four trades: TREND / MR x LONG / SHORT.
+
+    A trade opened at the close of the last bar of the window, SL and TP in ATR units
+    (the agent's own rules, see agent/strategy_head.py). Two outputs per combo:
+      hit  = P(SL or TP touched within the horizon)   (0 = still open, timeout)
+      side = P(TP first | hit)
+    P(TP) = P(hit) x P(TP first | hit).
+
+    Strategy and direction are learned embeddings concatenated to the market
+    embedding, so the four combos share one trunk. Trained on top of a FROZEN
+    encoder (the embedding the agent sees), not inside the encoder pretraining.
+    Parameter names match the v26 checkpoints the agent was built on.
+    """
+
+    STRATEGIES = ("trend", "mr")
+    DIRECTIONS = ("long", "short")
+    COMBOS = [(0, 0, "trend_long"), (0, 1, "trend_short"), (1, 0, "mr_long"), (1, 1, "mr_short")]
+
+    def __init__(
+        self,
+        emb_dim: int,
+        hidden: int = 64,
+        embed_dim: int = 8,
+        ctx_dim: int = 0,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.ctx_dim = ctx_dim
+        self.strategy_emb = nn.Embedding(2, embed_dim)
+        self.direction_emb = nn.Embedding(2, embed_dim)
+        self.shared = nn.Sequential(
+            nn.Linear(emb_dim + 2 * embed_dim + ctx_dim, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden // 2),
+            nn.ReLU(),
+        )
+        self.hit_trunk = nn.Sequential(
+            nn.Linear(hidden // 2, hidden // 2), nn.ReLU(), nn.Dropout(dropout)
+        )
+        self.side_trunk = nn.Sequential(
+            nn.Linear(hidden // 2, hidden // 2), nn.ReLU(), nn.Dropout(dropout)
+        )
+        self.hit_head = nn.Linear(hidden // 2, 1)
+        self.side_head = nn.Linear(hidden // 2, 1)
+
+    @classmethod
+    def from_state_dict(cls, state: dict, emb_dim: int) -> "StrategyOutcomeHead":
+        """Builds a head with the sizes of a saved state_dict (hidden, embed_dim, ctx_dim)."""
+        embed_dim = int(state["strategy_emb.weight"].shape[1])
+        hidden, trunk_in = (int(s) for s in state["shared.0.weight"].shape)
+        head = cls(
+            emb_dim, hidden=hidden, embed_dim=embed_dim, ctx_dim=trunk_in - emb_dim - 2 * embed_dim
+        )
+        head.load_state_dict(state)
+        return head
+
+    def forward(
+        self,
+        emb: torch.Tensor,
+        strategy: torch.Tensor,
+        direction: torch.Tensor,
+        extra_context: Optional[torch.Tensor] = None,
+    ):
+        """Returns: (hit_logit [B,1], side_logit [B,1])."""
+        parts = [emb, self.strategy_emb(strategy.long()), self.direction_emb(direction.long())]
+        if self.ctx_dim > 0:
+            if extra_context is None:
+                extra_context = emb.new_zeros(emb.size(0), self.ctx_dim)
+            parts.append(extra_context.to(emb.dtype))
+        h = self.shared(torch.cat(parts, dim=-1))
+        return self.hit_head(self.hit_trunk(h)), self.side_head(self.side_trunk(h))
+
+    def predict_all_combos(
+        self, emb: torch.Tensor, extra_context: Optional[torch.Tensor] = None
+    ) -> dict[str, torch.Tensor]:
+        """p_hit_<combo>, p_tp_given_hit_<combo>, p_tp_<combo>, p_sl_<combo>, p_none_<combo>."""
+        out = {}
+        for si, di, name in self.COMBOS:
+            s = torch.full((emb.size(0),), si, dtype=torch.long, device=emb.device)
+            d = torch.full((emb.size(0),), di, dtype=torch.long, device=emb.device)
+            hit_logit, side_logit = self.forward(emb, s, d, extra_context)
+            p_hit = torch.sigmoid(hit_logit).squeeze(-1)
+            p_side = torch.sigmoid(side_logit).squeeze(-1)
+            out[f"p_hit_{name}"] = p_hit
+            out[f"p_tp_given_hit_{name}"] = p_side
+            out[f"p_tp_{name}"] = p_hit * p_side
+            out[f"p_sl_{name}"] = p_hit * (1.0 - p_side)
+            out[f"p_none_{name}"] = 1.0 - p_hit
+        return out
+
+
 # ----------------------------
 # Augmentations
 # ----------------------------

@@ -33,18 +33,41 @@ import torch
 from dateutil.relativedelta import relativedelta
 from tqdm.auto import tqdm
 
+from encoder.dataset import _load_all_scalers_file
+
 from .arbiter import MultiAssetRunner, TradeArbiter
 from .config import DATA_ROOT, DEFAULT_CFG, MODELS_ROOT, RUN_CONFIGS, build_cfg
 from .env import (
     MarketEnv,
-    add_session_features,
-    build_encoder_feature_cols,
+    encoder_asset_id,
     ensure_datetime_index_utc,
     load_encoder_from_checkpoint,
 )
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+
+def _encoder_env_kwargs(encoder, asset: str, asset_map: dict) -> dict:
+    """asset_id / asset_name / scaler_map MarketEnv needs to rebuild the encoder input."""
+    scaler_map = None
+    meta = getattr(encoder, "input_meta", None) or {}
+    if meta.get("use_structural_features"):
+        sp = os.path.join(os.path.dirname(str(asset_map[asset])), "all_scalers.pkl")
+        scaler_map = _load_all_scalers_file(sp) if os.path.exists(sp) else None
+    return {
+        "asset_id": encoder_asset_id(encoder, asset, list(asset_map)),
+        "asset_name": asset,
+        "scaler_map": scaler_map,
+    }
+
+
+def _seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def _setup_file_logging(log_path: str):
@@ -779,11 +802,11 @@ def run_walk_forward_for_asset_map(
         msh = _enc_tuple[8] if len(_enc_tuple) > 8 else None
         soh = _enc_tuple[9] if len(_enc_tuple) > 9 else None  # strategy_outcome_head (v26)
 
+        # seed before the envs: their reset() draws random start points
+        _seed_everything(cfg.get("seed", 42))
         train_envs: dict[str, MarketEnv] = {}
         test_envs: dict[str, MarketEnv] = {}
         _asset_dfs: dict[str, Any] = {}  # df_full per asset — used by the secondary validation
-        ENCODER_FEATURE_COLS = None
-
         for asset, path in asset_map.items():
             try:
                 df_full = (
@@ -794,28 +817,7 @@ def run_walk_forward_for_asset_map(
                 df_full = ensure_datetime_index_utc(
                     df_full, tz_local=cfg.get("env_cfg", {}).get("tz_local", "Europe/Rome")
                 )
-                df_full = add_session_features(df_full)  # v22: add the 7 session cols (166→173)
                 _asset_dfs[asset] = df_full  # kept for the secondary validation
-                local_cols = build_encoder_feature_cols(df_full)
-                if ENCODER_FEATURE_COLS is None:
-                    ENCODER_FEATURE_COLS = local_cols
-                    expected_ch = getattr(encoder, "input_features", None)
-                    if expected_ch and len(ENCODER_FEATURE_COLS) != int(expected_ch):
-                        # mismatch: MarketEnv handles it (zero padding / truncation)
-                        logger.warning(
-                            "Feature count mismatch: encoder=%d, parquet=%d "
-                            "(handled by MarketEnv)",
-                            expected_ch,
-                            len(ENCODER_FEATURE_COLS),
-                        )
-                    logger.info(
-                        "Encoder feature cols: %d (encoder expects: %s)",
-                        len(ENCODER_FEATURE_COLS),
-                        getattr(encoder, "input_features", "?"),
-                    )
-                elif local_cols != ENCODER_FEATURE_COLS:
-                    raise AssertionError(f"Asset {asset} feature cols mismatch")
-
                 train_df = df_full.loc[train_start:train_end].copy()
                 test_df = df_full.loc[test_start:test_end].copy()
                 logger.info(
@@ -832,15 +834,13 @@ def run_walk_forward_for_asset_map(
                     continue
 
                 env_cfg = cfg.get("env_cfg", DEFAULT_CFG["env_cfg"]).copy()
-                env_cfg["encoder_feature_cols"] = ENCODER_FEATURE_COLS
                 tm = cfg.get("training_mode", "full")
                 env_cfg["training_mode"] = (
                     "train" if tm in ("full", "retrain", "train", "scratch") else tm
                 )
 
-                # v23: asset_id per AssetEmbedding (local to the class: 0..N-1)
-                _asset_list = sorted(asset_map.keys())
-                _asset_id = _asset_list.index(asset) if asset in _asset_list else 0
+                # asset id of the encoder's AssetEmbedding, encoder input meta
+                _enc_kw = _encoder_env_kwargs(encoder, asset, asset_map)
                 train_envs[asset] = MarketEnv(
                     train_df,
                     encoder,
@@ -849,11 +849,11 @@ def run_walk_forward_for_asset_map(
                     trend_head=trend_head,
                     vol_head=vol_head,
                     outcome_head=outcome_head,
-                    asset_id=_asset_id,
                     trend_mom_head=tmh,
                     regime_cont_head=rch,
                     mktstr_head=msh,
                     strategy_outcome_head=soh,
+                    **_enc_kw,
                 )
                 train_envs[asset].asset = asset
                 test_envs[asset] = MarketEnv(
@@ -864,11 +864,11 @@ def run_walk_forward_for_asset_map(
                     trend_head=trend_head,
                     vol_head=vol_head,
                     outcome_head=outcome_head,
-                    asset_id=_asset_id,
                     trend_mom_head=tmh,
                     regime_cont_head=rch,
                     mktstr_head=msh,
                     strategy_outcome_head=soh,
+                    **_enc_kw,
                 )
                 test_envs[asset].asset = asset
             except Exception:
@@ -881,13 +881,8 @@ def run_walk_forward_for_asset_map(
         state_dim = next(iter(train_envs.values()))._get_state().shape[0]
         logger.info("State dimension: %d", state_dim)
 
-        # Random seed
-        seed = cfg.get("seed", 42)
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
+        # Random seed (again: the env resets above used the RNG)
+        _seed_everything(cfg.get("seed", 42))
 
         # ── create the agent, with the WF -> WF warm start ─────────────────────────
         training_mode = cfg.get("training_mode", "full")
@@ -1199,14 +1194,11 @@ def run_walk_forward_for_asset_map(
             val_end = _to_utc(val_end_str)
             logger.info("[VAL] Secondary period %s → %s", val_start.date(), val_end.date())
             val_envs = {}
-            _val_asset_list = sorted(asset_map.keys())
             for asset, df_full in _asset_dfs.items():
                 val_df = df_full.loc[val_start:val_end].copy()
                 if len(val_df) < 100:
                     logger.warning("[VAL] %s: val_df too short (%d), skip", asset, len(val_df))
                     continue
-                # Bug fix: asset_map[asset] is a PATH (str), not an int
-                _val_asset_id = _val_asset_list.index(asset) if asset in _val_asset_list else 0
                 env_v = MarketEnv(
                     val_df,
                     encoder,
@@ -1215,7 +1207,7 @@ def run_walk_forward_for_asset_map(
                     trend_head=trend_head,
                     vol_head=vol_head,
                     outcome_head=outcome_head,
-                    asset_id=_val_asset_id,
+                    **_encoder_env_kwargs(encoder, asset, asset_map),
                     trend_mom_head=tmh,
                     regime_cont_head=rch,
                     mktstr_head=msh,
@@ -1477,7 +1469,8 @@ def run_walk_forward_joint(
         msh_m = enc_m[8] if len(enc_m) > 8 else None
         soh_m = enc_m[9] if len(enc_m) > 9 else None  # strategy_outcome_head (v26)
 
-        # build the envs of every asset
+        # build the envs of every asset (seeded: their reset() draws random start points)
+        _seed_everything(cfg.get("seed", 42))
         all_train_envs: dict[str, MarketEnv] = {}
         all_test_envs: dict[str, MarketEnv] = {}
         asset_class_map: dict[str, str] = {}
@@ -1486,7 +1479,6 @@ def run_walk_forward_joint(
             ("Majors", majors_map, encoder_M, rh_M, th_M, vh_M, oh_M, tmh_M, rch_M, msh_M, soh_M),
             ("Minors", minors_map, encoder_m, rh_m, th_m, vh_m, oh_m, tmh_m, rch_m, msh_m, soh_m),
         ]:
-            COLS = None
             for asset, path in a_map.items():
                 try:
                     df_full = (
@@ -1497,9 +1489,6 @@ def run_walk_forward_joint(
                     df_full = ensure_datetime_index_utc(
                         df_full, tz_local=cfg.get("env_cfg", {}).get("tz_local", "Europe/Rome")
                     )
-                    df_full = add_session_features(df_full)
-                    if COLS is None:
-                        COLS = build_encoder_feature_cols(df_full)
 
                     train_df = df_full.loc[train_start:train_end].copy()
                     test_df = df_full.loc[test_start:test_end].copy()
@@ -1509,13 +1498,11 @@ def run_walk_forward_joint(
                         continue
 
                     env_cfg = cfg.get("env_cfg", DEFAULT_CFG["env_cfg"]).copy()
-                    env_cfg["encoder_feature_cols"] = COLS
                     tm = cfg.get("training_mode", "full")
                     env_cfg["training_mode"] = (
                         "train" if tm in ("full", "retrain", "train", "scratch") else tm
                     )
-                    _asset_list = sorted(a_map.keys())
-                    _asset_id = _asset_list.index(asset) if asset in _asset_list else 0
+                    _enc_kw = _encoder_env_kwargs(enc, asset, a_map)
 
                     all_train_envs[asset] = MarketEnv(
                         train_df,
@@ -1525,11 +1512,11 @@ def run_walk_forward_joint(
                         trend_head=th,
                         vol_head=vh,
                         outcome_head=oh,
-                        asset_id=_asset_id,
                         trend_mom_head=tmh,
                         regime_cont_head=rch,
                         mktstr_head=msh,
                         strategy_outcome_head=soh,
+                        **_enc_kw,
                     )
                     all_train_envs[asset].asset = asset
                     all_test_envs[asset] = MarketEnv(
@@ -1540,11 +1527,11 @@ def run_walk_forward_joint(
                         trend_head=th,
                         vol_head=vh,
                         outcome_head=oh,
-                        asset_id=_asset_id,
                         trend_mom_head=tmh,
                         regime_cont_head=rch,
                         mktstr_head=msh,
                         strategy_outcome_head=soh,
+                        **_enc_kw,
                     )
                     all_test_envs[asset].asset = asset
                     asset_class_map[asset] = cls_name
@@ -1736,16 +1723,20 @@ def _wf_number(path: Path) -> int:
 
 
 def find_encoder_checkpoints(models_root, class_name: str) -> dict[int, str]:
-    """{0: bootstrap, 1: WF1 retrain, ...} from <models>/Encoder/<class>/Checkpoint."""
-    base = Path(models_root) / "Encoder" / class_name / "Checkpoint"
+    """
+    {0: Bootstrap, n: WFn} — the encoder checkpoints with the agent's StrategyOutcomeHead,
+    <models>/Encoder/<class>/Agent/<run>/encoder_agent.pth (python -m agent.strategy_head).
+    """
+    base = Path(models_root) / "Encoder" / class_name / "Agent"
     found = {}
-    boot = base / "Bootstrap" / "best_full_checkpoint.pth"
-    if boot.exists():
-        found[0] = str(boot)
-    for wf_dir in sorted((base / "Retrain").glob("WF*"), key=_wf_number):
-        ckpt = wf_dir / f"retrain_full_{wf_dir.name}.pth"
-        if _wf_number(wf_dir) > 0 and ckpt.exists():
-            found[_wf_number(wf_dir)] = str(ckpt)
+    for run_dir in sorted(base.glob("*"), key=_wf_number):
+        ckpt = run_dir / "encoder_agent.pth"
+        if not ckpt.exists():
+            continue
+        if run_dir.name == "Bootstrap":
+            found[0] = str(ckpt)
+        elif _wf_number(run_dir) > 0:
+            found[_wf_number(run_dir)] = str(ckpt)
     return found
 
 
@@ -1821,6 +1812,12 @@ def main(argv=None):
     for c, found in encoders.items():
         logger.info(
             "%s encoders: %s", c, {k: Path(v).parent.name for k, v in found.items()} or "none found"
+        )
+    missing = [c for c in cfg.get("run_classes", ["Majors", "Minors"]) if not encoders.get(c)]
+    if missing:
+        raise SystemExit(
+            f"no agent encoder checkpoints for {missing} in {args.models_root}/Encoder/<class>/Agent: "
+            "run python -m agent.strategy_head first"
         )
 
     keepalive_thread = None

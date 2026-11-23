@@ -1043,7 +1043,7 @@ if __name__ == "__main__":
     import os
     import tempfile
 
-    STATE_DIM = 204  # v26+ state vector: 128 emb + heads + market + position + SOH + session
+    STATE_DIM = 200  # state vector: 128 emb + heads + market + position + SOH + session
     cfg = {
         "n_actions": 5,  # HOLD, LONG_TREND, SHORT_TREND, LONG_MR, SHORT_MR (v26)
         "hidden_dims": [256, 256, 128],

@@ -5,15 +5,17 @@ MarketEnv walks one asset bar by bar (15min) on the scaled multi-TF parquet:
  - the frozen market encoder turns the last seq_len bars into an embedding, and its
    heads give trend momentum, continuous regime (vol regime, ATR, ADX, DI direction),
    breakout probabilities and the StrategyOutcomeHead P(TP) of TREND / MR, long / short
- - state vector (204 dims): embedding + head signals + market indicators + time
-   buckets + position-aware features (unrealized PnL, MFE/MAE, distance to SL/TP)
-   + daily risk + joint portfolio context + session validity
+ - state vector (gru_hidden + 72 dims, 200 with the default encoder): embedding + head
+   signals + market indicators + time buckets + position-aware features (unrealized
+   PnL, MFE/MAE, distance to SL/TP) + daily risk + joint portfolio context + session
+   validity
  - 5 actions: HOLD, LONG_TREND, SHORT_TREND, LONG_MR, SHORT_MR; SL/TP in ATR units,
    checked on the raw 15min high/low; spread by session hour, swap, force close
  - reward: realized R plus dense shaping (mark-to-market, opportunity cost, periodic
    Sharpe bonus, hold reward), training mode aware reset (scratch | retrain | eval)
- - helpers to load the encoder checkpoint and its heads without importing the encoder
-   package (the heads are rebuilt from the state_dict shapes)
+
+The encoder, its heads and its input (feature columns, session / structural features)
+come from the encoder package, so the agent sees exactly what the encoder was trained on.
 """
 
 import logging
@@ -27,7 +29,15 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
+from encoder.components import (
+    MarketStructureHead,
+    RegimeContinuousHead,
+    StrategyOutcomeHead,
+    TCNGRUEncoder,
+    TrendMomentumHeadTF,
+)
+from encoder.dataset import autodetect_feature_columns, encoder_input_matrix
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -48,579 +58,203 @@ def ensure_datetime_index_utc(df: pd.DataFrame, tz_local: str = "Europe/Rome") -
 
 
 # ----------------------------
-# Minimal encoder classes (TCN-GRU) — UNCHANGED
+# Encoder checkpoint
 # ----------------------------
-class Chomp1d(nn.Module):
-    def __init__(self, chomp):
-        super().__init__()
-        self.chomp = chomp
+def _strip_prefix(state: dict) -> dict:
+    """Drops the 'module.' / '_orig_mod.' prefixes of DataParallel / torch.compile."""
+    out = {}
+    for k, v in state.items():
+        for p in ("module.", "_orig_mod."):
+            if k.startswith(p):
+                k = k[len(p) :]
+        out[k] = v
+    return out
 
-    def forward(self, x):
-        return x if self.chomp == 0 else x[:, :, : -self.chomp].contiguous()
 
-
-class TemporalBlock(nn.Module):
-    def __init__(self, n_in, n_out, k, dilation, padding, dropout=0.1):
-        super().__init__()
-        self.conv1 = nn.Conv1d(n_in, n_out, k, padding=padding, dilation=dilation)
-        self.chomp1 = Chomp1d(padding)
-        self.relu1 = nn.ReLU()
-        self.drop1 = nn.Dropout(dropout)
-        self.conv2 = nn.Conv1d(n_out, n_out, k, padding=padding, dilation=dilation)
-        self.chomp2 = Chomp1d(padding)
-        self.relu2 = nn.ReLU()
-        self.drop2 = nn.Dropout(dropout)
-        self.net = nn.Sequential(
-            self.conv1,
-            self.chomp1,
-            self.relu1,
-            self.drop1,
-            self.conv2,
-            self.chomp2,
-            self.relu2,
-            self.drop2,
+def _build_encoder(state: dict, seq_len: int) -> tuple[TCNGRUEncoder, int, int]:
+    """TCNGRUEncoder with the sizes of a saved state_dict. Returns (encoder, n_inputs, hidden)."""
+    blocks = sorted(
+        {
+            int(k.split(".")[2])
+            for k in state
+            if k.startswith("tcn.network.") and k.endswith(".conv1.weight")
+        }
+    )
+    convs = [state[f"tcn.network.{i}.conv1.weight"] for i in blocks]
+    tcn_channels = [int(w.shape[0]) for w in convs]
+    kernel_size = int(convs[0].shape[2])
+    gru_hidden = int(state["gru.weight_hh_l0"].shape[1])
+    gru_layers = len([k for k in state if k.startswith("gru.weight_hh_l")])
+    n_assets, embed_dim = 0, 0
+    if "asset_embedding.embedding.weight" in state:
+        n_assets, embed_dim = (int(s) for s in state["asset_embedding.embedding.weight"].shape)
+    n_inputs = int(convs[0].shape[1]) - embed_dim
+    encoder = TCNGRUEncoder(
+        input_features=n_inputs,
+        seq_len=seq_len,
+        tcn_channels=tcn_channels,
+        kernel_size=kernel_size,
+        gru_hidden=gru_hidden,
+        gru_layers=gru_layers,
+        layer_norm="layer_norm.weight" in state,
+        n_assets=n_assets,
+        asset_embed_dim=embed_dim or 8,
+    )
+    missing, unexpected = encoder.load_state_dict(state, strict=False)
+    if missing or unexpected:
+        raise RuntimeError(
+            f"encoder checkpoint doesn't match TCNGRUEncoder: missing={missing[:5]} "
+            f"unexpected={unexpected[:5]}"
         )
-        self.downsample = nn.Conv1d(n_in, n_out, 1) if n_in != n_out else None
-        self.relu = nn.ReLU()
-
-    def forward(self, x):
-        out = self.net(x)
-        res = x if self.downsample is None else self.downsample(x)
-        return self.relu(out + res)
+    return encoder, n_inputs, gru_hidden
 
 
-class TCNEncoderBlock(nn.Module):
-    def __init__(self, num_inputs, channels, kernel_size=3, dropout=0.1):
-        super().__init__()
-        layers = []
-        for i, ch in enumerate(channels):
-            in_ch = num_inputs if i == 0 else channels[i - 1]
-            dilation = 2**i
-            padding = (kernel_size - 1) * dilation
-            layers.append(TemporalBlock(in_ch, ch, kernel_size, dilation, padding, dropout))
-        self.network = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.network(x)
-
-
-class TCNGRUEncoder(nn.Module):
-    """v23: optional asset embedding support (n_assets=0 = backward compatible)."""
-
-    def __init__(
-        self,
-        input_features: int,
-        seq_len: int,
-        tcn_channels: list[int],
-        kernel_size: int = 3,
-        gru_hidden: int = 128,
-        gru_layers: int = 1,
-        dropout: float = 0.1,
-        layer_norm: bool = True,
-        n_assets: int = 0,
-        asset_embed_dim: int = 8,
-    ):
-        super().__init__()
-        self.seq_len = seq_len
-        self.n_assets = n_assets
-        self.asset_embed_dim = asset_embed_dim if n_assets > 0 else 0
-        if n_assets > 0:
-            self.asset_embedding: Optional[nn.Module] = nn.Embedding(n_assets, asset_embed_dim)
-            tcn_input = input_features + asset_embed_dim
-        else:
-            self.asset_embedding = None
-            tcn_input = input_features
-        self.tcn = TCNEncoderBlock(tcn_input, tcn_channels, kernel_size, dropout)
-        self.gru = nn.GRU(
-            input_size=tcn_channels[-1],
-            hidden_size=gru_hidden,
-            num_layers=gru_layers,
-            batch_first=True,
+def _build_heads(ckpt: dict, hidden: int) -> dict[str, Optional[nn.Module]]:
+    """Trend momentum, continuous regime, market structure and strategy outcome heads."""
+    heads: dict[str, Optional[nn.Module]] = {
+        "trend_mom_head": None,
+        "regime_cont_head": None,
+        "mktstr_head": None,
+        "strategy_outcome_head": None,
+    }
+    n_tfs = None
+    st = ckpt.get("trend_head_state")
+    if st:
+        st = _strip_prefix(st)
+        n_tfs = int(st["fc2.weight"].shape[0])
+        h = TrendMomentumHeadTF(hidden, n_tfs, hidden=int(st["fc1.weight"].shape[0]))
+        h.load_state_dict(st)
+        heads["trend_mom_head"] = h
+    st = ckpt.get("regime_cont_head_state")
+    if st:
+        st = _strip_prefix(st)
+        n_tfs = n_tfs or int(ckpt.get("cfg", {}).get("n_tfs", 5))
+        n_signals = int(st["fc3.weight"].shape[0]) // n_tfs
+        h = RegimeContinuousHead(
+            hidden, n_tfs, n_signals=n_signals, hidden=int(st["fc1.weight"].shape[0])
         )
-        self.layer_norm = nn.LayerNorm(gru_hidden) if layer_norm else None
-        self.dropout = nn.Dropout(dropout)
-        self.input_features = input_features
-        self.gru_hidden = gru_hidden
-
-    def forward(self, x, asset_ids=None):
-        if self.asset_embedding is not None and asset_ids is not None:
-            tok = self.asset_embedding(asset_ids)  # [B, embed_dim]
-            tok = tok.unsqueeze(1).expand(-1, x.size(1), -1)
-            x = torch.cat([x, tok], dim=-1)
-        x = x.permute(0, 2, 1)
-        tcn_out = self.tcn(x)
-        tcn_out = tcn_out.permute(0, 2, 1)
-        out, h = self.gru(tcn_out)
-        emb = h[-1]
-        if self.layer_norm is not None:
-            emb = self.layer_norm(emb)
-        emb = self.dropout(emb)
-        return emb
-
-
-def strip_prefix(k: str) -> str:
-    for p in ("module.encoder.", "module.", "encoder.", "model.encoder.", "model."):
-        if k.startswith(p):
-            return k[len(p) :]
-    return k
-
-
-def _load_head_from_state(
-    state_dict: dict, device: str, head_name: str = "head"
-) -> Optional[nn.Module]:
-    """Load auxiliary head from state_dict with automatic architecture detection.
-
-    Auto-detects architecture from fc layer keys:
-      - fc1+fc2          → 2-layer MLP (TrendMomentumHeadTF, VolatilityHeadTF, etc.)
-      - fc1+fc2+fc3      → 3-layer MLP with softplus (RegimeContinuousHead)
-      - other            → Sequential auto-build
-    """
-    if not state_dict or not isinstance(state_dict, dict):
-        logger.warning("%s state is empty or invalid", head_name)
-        return None
-    try:
-        # ── v26: StrategyOutcomeHead — detected from strategy_emb.weight + shared.0.weight ──
-        # typical keys: strategy_emb.weight, direction_emb.weight,
-        #   shared.0.weight, shared.3.weight, hit_trunk.0.weight, side_trunk.0.weight,
-        #   hit_head.weight, side_head.weight
-        if "strategy_emb.weight" in state_dict and "shared.0.weight" in state_dict:
-            _s_emb_w = state_dict["strategy_emb.weight"]  # [2, embed_dim]
-            _sh0_w = state_dict["shared.0.weight"]  # [hidden, trunk_in]
-            _embed_d = int(_s_emb_w.shape[1])
-            _hidden = int(_sh0_w.shape[0])
-            _trunk_in = int(_sh0_w.shape[1])
-            # emb_dim inferred: trunk_in − strategy_embed − direction_embed − ctx_dim
-            # ctx_dim = 0 unless there's an extra key; computed afterwards
-            # Note: ctx_dim isn't known directly -> try 0 and recompute
-            # in practice: trunk_in = emb_dim + 2*embed_dim + ctx_dim
-            # emb_dim = gru_hidden (128), so:
-            # ctx_dim = trunk_in - emb_dim - 2*embed_dim (computed by the caller)
-            # Left at 0 here because _load_head_from_state doesn't know gru_hidden.
-            # The caller (load_encoder_from_checkpoint) knows gru_hidden and
-            # fixes ctx_dim afterwards.
-            # This branch is only a fallback for generic calls.
-            _dropout = 0.1  # default, not stored in the state_dict
-
-            class _StrategyOutcomeHeadInline(nn.Module):
-                """Inline copy of StrategyOutcomeHead — no external import."""
-
-                COMBOS = [
-                    (0, 0, "trend_long"),
-                    (0, 1, "trend_short"),
-                    (1, 0, "mr_long"),
-                    (1, 1, "mr_short"),
-                ]
-
-                def __init__(self):
-                    super().__init__()
-                    self.embed_dim = _embed_d
-                    self.hidden = _hidden
-                    self.ctx_dim = 0  # updated after load_state_dict if needed
-                    self.strategy_emb = nn.Embedding(2, _embed_d)
-                    self.direction_emb = nn.Embedding(2, _embed_d)
-                    self.shared = nn.Sequential(
-                        nn.Linear(_trunk_in, _hidden),
-                        nn.ReLU(),
-                        nn.Dropout(_dropout),
-                        nn.Linear(_hidden, _hidden // 2),
-                        nn.ReLU(),
-                    )
-                    self.hit_trunk = nn.Sequential(
-                        nn.Linear(_hidden // 2, _hidden // 2), nn.ReLU(), nn.Dropout(_dropout)
-                    )
-                    self.side_trunk = nn.Sequential(
-                        nn.Linear(_hidden // 2, _hidden // 2), nn.ReLU(), nn.Dropout(_dropout)
-                    )
-                    self.hit_head = nn.Linear(_hidden // 2, 1)
-                    self.side_head = nn.Linear(_hidden // 2, 1)
-
-                def forward(self, emb, strategy, direction, extra_context=None):
-                    s_emb = self.strategy_emb(strategy.long())
-                    d_emb = self.direction_emb(direction.long())
-                    parts = [emb, s_emb, d_emb]
-                    if extra_context is not None:
-                        parts.append(extra_context.to(emb.dtype))
-                    x = torch.cat(parts, dim=-1)
-                    h = self.shared(x)
-                    return self.hit_head(self.hit_trunk(h)), self.side_head(self.side_trunk(h))
-
-                def predict_all_combos(self, emb, extra_context=None):
-                    B, device = emb.size(0), emb.device
-                    out = {}
-                    for si, di, pfx in self.COMBOS:
-                        s_t = torch.full((B,), si, dtype=torch.long, device=device)
-                        d_t = torch.full((B,), di, dtype=torch.long, device=device)
-                        hl, sl = self.forward(emb, s_t, d_t, extra_context)
-                        p_hit = torch.sigmoid(hl).squeeze(-1)
-                        p_tp_h = torch.sigmoid(sl).squeeze(-1)
-                        out[f"p_hit_{pfx}"] = p_hit
-                        out[f"p_tp_given_hit_{pfx}"] = p_tp_h
-                        out[f"p_tp_{pfx}"] = p_hit * p_tp_h
-                        out[f"p_sl_{pfx}"] = p_hit * (1.0 - p_tp_h)
-                        out[f"p_none_{pfx}"] = 1.0 - p_hit
-                    return out
-
-            head = _StrategyOutcomeHeadInline()
-            head.load_state_dict(state_dict, strict=True)
-            head.to(device).float().eval()
-            logger.info(
-                "%s loaded (StrategyOutcomeHead inline: hidden=%d embed_dim=%d)",
-                head_name,
-                _hidden,
-                _embed_d,
-            )
-            return head
-        fc_emb_w = state_dict.get("fc_emb.weight")
-        fc_dir_w = state_dict.get("fc_dir.weight")
-        fc_out_w = state_dict.get("fc_out.weight")
-        if fc_emb_w is not None and fc_dir_w is not None and fc_out_w is not None:
-            emb_in = int(fc_emb_w.shape[1])
-            emb_h = int(fc_emb_w.shape[0])
-            dir_in = int(fc_dir_w.shape[1])
-            dir_h = int(fc_dir_w.shape[0])  # can differ from emb_h
-            out_in = int(fc_out_w.shape[1])
-            out_dim = int(fc_out_w.shape[0])
-
-            class HeadDirCond(nn.Module):
-                def __init__(self):
-                    super().__init__()
-                    self.fc_emb = nn.Linear(emb_in, emb_h)
-                    self.fc_dir = nn.Linear(dir_in, dir_h)
-                    self.fc_out = nn.Linear(out_in, out_dim)
-
-                def forward(self, x, direction=None):
-                    h = F.relu(self.fc_emb(x))
-                    if direction is not None:
-                        if direction.dim() == 1:
-                            direction = direction.unsqueeze(-1)
-                        h = h + F.relu(self.fc_dir(direction.float()))
-                    return self.fc_out(h)
-
-            head = HeadDirCond()
-            head.load_state_dict(state_dict, strict=True)
-            head.to(device)
-            head.eval()
-            logger.info("%s loaded (direction-conditioned arch)", head_name)
-            return head
-
-        fc_keys = sorted([k for k in state_dict.keys() if k.startswith("fc") and "weight" in k])
-
-        if fc_keys:
-            # Detect number of fc layers
-            n_layers = len(fc_keys)
-            in_dim = state_dict[fc_keys[0]].shape[1]
-            hidden_dim = state_dict[fc_keys[0]].shape[0]
-
-            if n_layers == 3:
-                # 3-layer MLP — RegimeContinuousHead style: fc1→relu→fc2→relu→fc3→softplus
-                hidden2_dim = state_dict[fc_keys[1]].shape[0]
-                out_dim = state_dict[fc_keys[2]].shape[0]
-
-                class Head3(nn.Module):
-                    def __init__(self):
-                        super().__init__()
-                        self.fc1 = nn.Linear(in_dim, hidden_dim)
-                        self.fc2 = nn.Linear(hidden_dim, hidden2_dim)
-                        self.fc3 = nn.Linear(hidden2_dim, out_dim)
-
-                    def forward(self, x):
-                        return F.softplus(self.fc3(F.relu(self.fc2(F.relu(self.fc1(x))))))
-
-                head = Head3()
-            else:
-                # 2-layer MLP — default
-                out_dim = state_dict[fc_keys[-1]].shape[0]
-
-                class Head2(nn.Module):
-                    def __init__(self):
-                        super().__init__()
-                        self.fc1 = nn.Linear(in_dim, hidden_dim)
-                        self.relu = nn.ReLU()
-                        self.fc2 = nn.Linear(hidden_dim, out_dim)
-
-                    def forward(self, x):
-                        return self.fc2(self.relu(self.fc1(x)))
-
-                head = Head2()
-            head.load_state_dict(state_dict, strict=True)
-        else:
-            # Fallback: Sequential auto-build
-            layer_keys = sorted([k for k in state_dict.keys() if "weight" in k])
-            layers = []
-            for i, key in enumerate(layer_keys):
-                weight = state_dict[key]
-                out_dim, in_dim = weight.shape
-                layers.append(nn.Linear(in_dim, out_dim))
-                if i < len(layer_keys) - 1:
-                    layers.append(nn.ReLU())
-            head = nn.Sequential(*layers)
-            head.load_state_dict(state_dict, strict=True)
-
-        head.to(device)
-        head.eval()
-        logger.info("%s loaded successfully", head_name)
-        return head
-    except Exception as e:
-        logger.exception("Failed to load %s: %s", head_name, e)
-        return None
+        h.load_state_dict(st)
+        heads["regime_cont_head"] = h
+    st = ckpt.get("mktstructure_head_state")
+    if st:
+        st = _strip_prefix(st)
+        n_tfs = n_tfs or 5
+        n_out = int(st["fc2.weight"].shape[0])
+        h = MarketStructureHead(
+            hidden, n_tfs, n_classes=n_out // n_tfs, hidden=int(st["fc1.weight"].shape[0])
+        )
+        h.load_state_dict(st)
+        heads["mktstr_head"] = h
+    st = ckpt.get("strategy_outcome_head_state")
+    if st:
+        heads["strategy_outcome_head"] = StrategyOutcomeHead.from_state_dict(
+            _strip_prefix(st), hidden
+        )
+    return heads
 
 
 def load_encoder_from_checkpoint(
-    path: str,
-    device: str,
-    seq_len: int,
-    load_regime_head: bool = True,
-    load_trend_head: bool = True,
-    load_vol_head: bool = True,
-    load_outcome_head: bool = True,  # v23: outcome head for the arbiter filter
-    fallback_channels=None,
-    fallback_gru_hidden=128,
+    checkpoint_path: str,
+    device: str = "cpu",
+    seq_len: int = 128,
+    **_legacy,
 ):
-    """Load encoder and optional heads. v23: outcome_head and asset_embedding support."""
-    if fallback_channels is None:
-        fallback_channels = [64, 64, 128]
-    if not os.path.exists(path):
-        raise FileNotFoundError(path)
-    ckpt = torch.load(path, map_location="cpu")
-    if isinstance(ckpt, nn.Module):
-        enc = ckpt.to(device)
-        enc.eval()
-        return enc, getattr(enc, "gru_hidden", fallback_gru_hidden), None, None, None
-    if not isinstance(ckpt, dict):
-        raise RuntimeError("Checkpoint format not recognized (expected dict)")
+    """
+    Loads an encoder checkpoint of the encoder package, with the agent's StrategyOutcomeHead
+    when there is one (agent/strategy_head.py adds it).
 
-    encoder_state = None
-    cfg_ckpt = ckpt.get("cfg", {}) or {}
-    for key in ("encoder_state_dict", "encoder_state", "encoder"):
-        if key in ckpt and isinstance(ckpt[key], dict):
-            encoder_state = ckpt[key]
-            break
-    if encoder_state is None:
-        for key in ("model_state", "model_state_dict", "state_dict", "model"):
-            if key in ckpt and isinstance(ckpt[key], dict):
-                cand = ckpt[key]
-                enc_keys = {
-                    strip_prefix(k): v
-                    for k, v in cand.items()
-                    if any(x in k.lower() for x in ("tcn", "gru", "encoder", "temporal"))
-                }
-                encoder_state = enc_keys if enc_keys else cand
-                break
-    if encoder_state is None:
-        raise RuntimeError("Unable to find encoder state_dict in checkpoint")
-
-    input_features = cfg_ckpt.get("input_dim") or cfg_ckpt.get("input_features") or 166
-    tcn_channels = cfg_ckpt.get("tcn_channels") or fallback_channels
-    kernel_size = cfg_ckpt.get("kernel_size", 3)
-    gru_hidden = cfg_ckpt.get("gru_hidden", fallback_gru_hidden)
-    gru_layers = cfg_ckpt.get("gru_layers", 1)
-    dropout = cfg_ckpt.get("dropout", 0.2)
-    # ── Detect n_assets / asset_embed_dim from encoder_state ─────────────
-    # encoder_meta and cfg keys are missing from v25 checkpoints — derived from the weights.
-    enc_meta = ckpt.get("encoder_meta", {}) or {}
-    n_assets = int(enc_meta.get("n_assets", cfg_ckpt.get("n_assets", 0)))
-    asset_embed_dim = int(enc_meta.get("asset_embed_dim", cfg_ckpt.get("asset_embed_dim", 8)))
-    # v25: read the shape straight from the embedding weight if present
-    ae_key = "asset_embedding.embedding.weight"
-    if ae_key in encoder_state and isinstance(encoder_state[ae_key], torch.Tensor):
-        ae_w = encoder_state[ae_key]
-        if ae_w.dim() == 2:
-            n_assets = int(ae_w.shape[0])
-            asset_embed_dim = int(ae_w.shape[1])
-            logger.info(
-                "asset_embedding detected from checkpoint: n_assets=%d embed_dim=%d",
-                n_assets,
-                asset_embed_dim,
-            )
-    for k, v in encoder_state.items():
-        if "conv1.weight" in k and isinstance(v, torch.Tensor):
-            try:
-                raw_ch = int(v.shape[1])
-                if n_assets > 0:
-                    raw_ch = raw_ch - asset_embed_dim
-                input_features = raw_ch
-                break
-            except Exception:
-                pass
-    if n_assets > 0:
-        logger.info(
-            "Encoder with asset embedding: n_assets=%d embed_dim=%d", n_assets, asset_embed_dim
-        )
-    encoder = TCNGRUEncoder(
-        input_features,
-        seq_len,
-        tcn_channels,
-        kernel_size,
-        gru_hidden,
-        gru_layers,
-        dropout,
-        n_assets=n_assets,
-        asset_embed_dim=asset_embed_dim,
+    Returns (encoder, gru_hidden, regime_head, trend_head, vol_head, outcome_head,
+    trend_mom_head, regime_cont_head, mktstr_head, strategy_outcome_head). The legacy
+    classification heads (regime / trend / vol / outcome) of the old encoders are always
+    None. The encoder carries `input_meta`: what dataset.encoder_input_matrix needs to
+    rebuild its input (None in checkpoints saved before it was stored).
+    """
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    if not isinstance(ckpt, dict) or not any(
+        k in ckpt for k in ("encoder_state", "encoder_state_dict", "model_state", "state_dict")
+    ):
+        ckpt = {"encoder_state": ckpt}
+    state = next(
+        ckpt[k]
+        for k in ("encoder_state", "encoder_state_dict", "model_state", "state_dict")
+        if k in ckpt
     )
-    model_sd = encoder.state_dict()
-    mapped = {}
-    for sk, v in encoder_state.items():
-        sk2 = strip_prefix(sk)
-        if sk2 in model_sd and tuple(model_sd[sk2].shape) == tuple(v.shape):
-            mapped[sk2] = v
-        else:
-            for mk in model_sd.keys():
-                if mk.endswith(sk2) and tuple(model_sd[mk].shape) == tuple(v.shape):
-                    mapped[mk] = v
-                    break
-    try:
-        encoder.load_state_dict(mapped, strict=False)
-        logger.info("Encoder loaded: input_features=%d gru_hidden=%d", input_features, gru_hidden)
-    except Exception as e:
-        logger.warning("Encoder load incomplete: %s", e)
-    encoder.to(device)
-    encoder.eval()
-
-    # ── Load auxiliary heads ─────────────────────────────────────────────
-    # v25 checkpoint: keys "trend_head_state", "regime_cont_head_state", etc.
-    # v23 legacy:     keys "trend_head", "regime_cont_head", etc.
-    def _ckpt_head(primary_key: str, *fallback_keys: str) -> Optional[dict]:
-        for k in (primary_key,) + fallback_keys:
-            v = ckpt.get(k)
-            if v is not None and isinstance(v, dict) and len(v) > 0:
-                return v
-        return None
-
-    regime_head = (
-        _load_head_from_state(_ckpt_head("regime_head_state", "regime_head"), device, "regime_head")
-        if load_regime_head
-        else None
+    encoder, n_inputs, hidden = _build_encoder(_strip_prefix(state), seq_len)
+    encoder.input_features = n_inputs
+    encoder.input_meta = (ckpt.get("extra") or {}).get("inputs")
+    heads = _build_heads(ckpt, hidden)
+    modules = [encoder] + [m for m in heads.values() if m is not None]
+    for m in modules:
+        m.to(device).eval()
+        for p in m.parameters():
+            p.requires_grad_(False)
+    logger.info(
+        "Encoder loaded: %s | inputs=%d hidden=%d | heads: %s | input meta: %s",
+        os.path.basename(checkpoint_path),
+        n_inputs,
+        hidden,
+        ", ".join(k for k, v in heads.items() if v is not None) or "none",
+        "yes" if encoder.input_meta else "no (autodetect)",
     )
-    trend_head = (
-        _load_head_from_state(_ckpt_head("trend_head_state", "trend_head"), device, "trend_head")
-        if load_trend_head
-        else None
-    )
-    vol_head = (
-        _load_head_from_state(_ckpt_head("vol_head_state", "vol_head"), device, "vol_head")
-        if load_vol_head
-        else None
-    )
-
-    # v25: head continue
-    trend_mom_head = _load_head_from_state(
-        _ckpt_head("trend_head_state", "trend_head"), device, "trend_mom_head"
-    )
-    regime_cont_head = _load_head_from_state(
-        _ckpt_head("regime_cont_head_state", "regime_cont_head"), device, "regime_cont_head"
-    )
-    mktstr_head = _load_head_from_state(
-        _ckpt_head("mktstructure_head_state", "mktstructure_head", "mktstr_head"),
-        device,
-        "mktstr_head",
-    )
-
-    outcome_head_sd = _ckpt_head("outcome_head_state", "outcome_head")
-    outcome_head = (
-        _load_head_from_state(outcome_head_sd, device, "outcome_head")
-        if load_outcome_head and outcome_head_sd
-        else None
-    )
-
-    # v26: StrategyOutcomeHead — loaded through _load_head_from_state (inline class)
-    # No import from the encoder package — same logic as the other heads.
-    # After loading, ctx_dim is fixed on the instance because _load_head_from_state
-    # doesn't know gru_hidden and sets it to 0 by default.
-    strategy_outcome_head = None
-    _soh_sd = _ckpt_head("strategy_outcome_head_state", "strategy_outcome_head")
-    if _soh_sd is not None:
-        strategy_outcome_head = _load_head_from_state(
-            _soh_sd, device, head_name="strategy_outcome_head"
-        )
-        if strategy_outcome_head is not None:
-            # Fix ctx_dim: trunk_in − gru_hidden − 2×embed_dim
-            try:
-                _embed_d_soh = int(_soh_sd["strategy_emb.weight"].shape[1])
-                _trunk_in = int(_soh_sd["shared.0.weight"].shape[1])
-                strategy_outcome_head.ctx_dim = max(
-                    0, _trunk_in - int(gru_hidden) - 2 * _embed_d_soh
-                )
-                logger.info(
-                    "strategy_outcome_head: ctx_dim set to %d", strategy_outcome_head.ctx_dim
-                )
-            except Exception as _e:
-                logger.warning("strategy_outcome_head: ctx_dim falls back to 0 (%s)", _e)
-
-    for name, head in [
-        ("regime_cont_head", regime_cont_head),
-        ("mktstr_head", mktstr_head),
-        ("trend_mom_head", trend_mom_head),
-        ("outcome_head", outcome_head),
-    ]:
-        logger.info("%s: %s", name, "loaded" if head is not None else "not found in checkpoint")
-
-    # Return tuple extended
     return (
         encoder,
-        int(gru_hidden),
-        regime_head,
-        trend_head,
-        vol_head,
-        outcome_head,
-        trend_mom_head,
-        regime_cont_head,
-        mktstr_head,
-        strategy_outcome_head,
+        hidden,
+        None,
+        None,
+        None,
+        None,
+        heads["trend_mom_head"],
+        heads["regime_cont_head"],
+        heads["mktstr_head"],
+        heads["strategy_outcome_head"],
     )
 
 
-# v22: session features computed from DatetimeIndex (same as encoder_dataset._compute_session_features)
-_SESSION_FEATURE_NAMES = [
-    "session_hour_sin",
-    "session_hour_cos",
-    "session_london",
-    "session_ny",
-    "session_overlap",
-    "session_dow_sin",
-    "session_dow_cos",
-]
+def encoder_asset_id(encoder: nn.Module, asset: str, assets: list[str]) -> int:
+    """Asset id the encoder was trained with (its asset_map), else the sorted position."""
+    meta = getattr(encoder, "input_meta", None) or {}
+    amap = {str(k).upper(): int(v) for k, v in (meta.get("asset_map") or {}).items()}
+    if str(asset).upper() in amap:
+        return amap[str(asset).upper()]
+    ordered = sorted(assets)
+    return ordered.index(asset) if asset in ordered else 0
 
 
-def add_session_features(df: pd.DataFrame) -> pd.DataFrame:
+def encoder_inputs(
+    df: pd.DataFrame,
+    encoder: nn.Module,
+    asset: Optional[str] = None,
+    scaler_map: Optional[dict] = None,
+) -> np.ndarray:
     """
-    Adds the 7 session / time-of-day features to the DataFrame if not there yet.
-    Must be called BEFORE build_encoder_feature_cols.
-    Same as encoder_dataset._compute_session_features (v22).
+    Encoder input of every row of `df`, built like the encoder dataset builds it (same
+    columns in the same order, session features, structural features with the training
+    statistics). Checkpoints without input metadata: autodetected columns + sessions.
     """
-    if _SESSION_FEATURE_NAMES[0] in df.columns:
-        return df  # already there
-    n = len(df)
-    try:
-        idx = df.index
-        if not isinstance(idx, pd.DatetimeIndex):
-            raise ValueError("Index is not DatetimeIndex")
-        idx_utc = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
-        h = idx_utc.hour.values.astype(np.float32)
-        m = idx_utc.minute.values.astype(np.float32)
-        h_frac = h + m / 60.0
-        h_int = idx_utc.hour.values
-        dow = idx_utc.dayofweek.values.astype(np.float32)
-        feats = np.stack(
-            [
-                np.sin(2.0 * np.pi * h_frac / 24.0).astype(np.float32),  # hour_sin
-                np.cos(2.0 * np.pi * h_frac / 24.0).astype(np.float32),  # hour_cos
-                ((h_int >= 7) & (h_int < 16)).astype(np.float32),  # london
-                ((h_int >= 13) & (h_int < 21)).astype(np.float32),  # ny
-                ((h_int >= 13) & (h_int < 16)).astype(np.float32),  # overlap
-                np.sin(2.0 * np.pi * dow / 5.0).astype(np.float32),  # dow_sin
-                np.cos(2.0 * np.pi * dow / 5.0).astype(np.float32),  # dow_cos
-            ],
-            axis=1,
+    meta = getattr(encoder, "input_meta", None)
+    if meta:
+        stats = (meta.get("structural_stats") or {}).get(str(asset).upper())
+        x = encoder_input_matrix(
+            df,
+            meta["feature_cols"],
+            use_session_features=meta.get("use_session_features", True),
+            use_structural_features=meta.get("use_structural_features", False),
+            structural_stats=stats,
+            scaler_map=scaler_map,
         )
-    except Exception as e:
-        logger.warning("Session feature computation failed (%s). Using zeros.", e)
-        feats = np.zeros((n, len(_SESSION_FEATURE_NAMES)), dtype=np.float32)
-    sess_df = pd.DataFrame(feats, index=df.index, columns=_SESSION_FEATURE_NAMES)
-    return pd.concat([df, sess_df], axis=1)
-
-
-def build_encoder_feature_cols(df: pd.DataFrame) -> list[str]:
-    return [c for c in df.columns if not str(c).endswith("_raw") and c != "timestamp"]
+    else:
+        tfs = ["15min", "30min", "1h", "4h", "1d"]
+        cols = autodetect_feature_columns(
+            pd.DataFrame(columns=[str(c).lower() for c in df.columns]), tfs
+        )
+        x = encoder_input_matrix(df, cols, use_session_features=True)
+    n_in = getattr(encoder, "input_features", x.shape[1])
+    if x.shape[1] != n_in:
+        raise ValueError(
+            f"encoder input has {x.shape[1]} features but the encoder expects {n_in}: "
+            "the data columns don't match the ones the encoder was trained on"
+        )
+    return x
 
 
 # ===========================================================================
@@ -651,6 +285,8 @@ class MarketEnv:
         regime_cont_head: Optional[nn.Module] = None,
         mktstr_head: Optional[nn.Module] = None,
         strategy_outcome_head: Optional[nn.Module] = None,
+        asset_name: Optional[str] = None,
+        scaler_map: Optional[dict] = None,
     ):
         # UTC checks
         if not isinstance(df.index, pd.DatetimeIndex):
@@ -660,8 +296,6 @@ class MarketEnv:
         if "UTC" not in str(df.index.tz):
             raise AssertionError(f"DataFrame index tz must be UTC, got {df.index.tz}")
 
-        # v22: add the session features if the scaled dataset doesn't have them
-        df = add_session_features(df)
         self.df = df.sort_index().copy()
         self.encoder = encoder
         self.regime_head = regime_head
@@ -707,53 +341,20 @@ class MarketEnv:
             "live": "live",
         }.get(tm_raw, tm_raw)
 
-        # Encoder feature cols
-        self.encoder_feature_cols: list[str] = config.get("encoder_feature_cols", [])
-        if not self.encoder_feature_cols:
-            logger.warning("No encoder_feature_cols; using default 5")
-            self.encoder_feature_cols = [
-                "open_15min",
-                "high_15min",
-                "low_15min",
-                "close_15min",
-                "volume_15min",
-            ]
+        # Encoder input: same columns, order, session / structural features as in the
+        # encoder training (encoder.dataset), computed once for the whole df
+        meta = getattr(self.encoder, "input_meta", None) or {}
+        self.encoder_feature_cols: list[str] = list(meta.get("feature_cols", []))
+        if meta.get("tf_list"):
+            self.model_tf_order = list(meta["tf_list"])
+        self._enc_x = (
+            encoder_inputs(self.df, self.encoder, asset_name, scaler_map)
+            if self.encoder is not None
+            else None
+        )
 
-        if self.encoder is not None:
-            expected_ch = getattr(self.encoder, "input_features", None)
-            if expected_ch:
-                n_actual = len(self.encoder_feature_cols)
-                self._encoder_expected_features = int(expected_ch)
-                self._encoder_feature_pad = max(0, int(expected_ch) - n_actual)
-                if self._encoder_feature_pad > 0:
-                    # The missing features are the asset embedding (asset_embed_dim=8),
-                    # added by the encoder itself in the forward pass.
-                    # No manual padding needed — asset_ids is passed in _get_state.
-                    logger.info(
-                        "Encoder input: %d raw features + %d asset_embed (total %d) "
-                        "— asset_ids passed in the forward",
-                        n_actual,
-                        self._encoder_feature_pad,
-                        int(expected_ch),
-                    )
-                elif n_actual > int(expected_ch):
-                    # too many features: truncate
-                    self.encoder_feature_cols = self.encoder_feature_cols[: int(expected_ch)]
-                    logger.warning(
-                        "Feature mismatch: encoder expects %d, parquet has %d (truncated to %d)",
-                        expected_ch,
-                        n_actual,
-                        int(expected_ch),
-                    )
-            else:
-                self._encoder_expected_features = None
-                self._encoder_feature_pad = 0
-        else:
-            self._encoder_expected_features = None
-            self._encoder_feature_pad = 0
-
-        # Core params
-        self.seq_len = int(config.get("seq_len", 128))
+        # Core params — the window length the encoder was trained with, when known
+        self.seq_len = int(meta.get("seq_len") or config.get("seq_len", 128))
         self.rr = float(config.get("rr", 1.8))
         self.rr_mr = float(config.get("rr_mr", 0.8))
         self.sl_atr_mult_mr = float(config.get("sl_atr_mult_mr", 1.0))
@@ -768,7 +369,13 @@ class MarketEnv:
         self.max_trades_per_day = int(config.get("max_trades_per_day", 5))
         self.max_dd = float(config.get("max_dd", 0.20))
         self.slippage_noise = float(config.get("slippage_noise", 0.1))
-        self.spread_col = config.get("spread_col", "spread_mean_15m_raw")
+        self.spread_col = config.get("spread_col", "spread_mean_15min_raw")
+        if self.spread_col not in self.df.columns:
+            logger.warning(
+                "spread column %s not in the data: fixed spread %.5f",
+                self.spread_col,
+                float(config.get("default_spread", 0.0001)),
+            )
         self.device = config.get("device", "cpu")
         self.daily_dd_limit = float(config.get("daily_dd_limit", 0.02))
         self.daily_soft_penalty = float(config.get("daily_soft_penalty", 0.2))
@@ -824,8 +431,8 @@ class MarketEnv:
         self.reset()
 
         logger.info(
-            "MarketEnv (PPO) init: features=%d seq_len=%d mode=%s " "mtm=%.2f opp=%.4f",
-            len(self.encoder_feature_cols),
+            "MarketEnv init: encoder inputs=%d seq_len=%d mode=%s mtm=%.2f opp=%.4f",
+            0 if self._enc_x is None else self._enc_x.shape[1],
             self.seq_len,
             self.training_mode,
             self.mtm_scale,
@@ -1135,7 +742,7 @@ class MarketEnv:
         ts = self.timestamps[idx]
         try:
             # Parquet timestamps are UTC; if naive, treat as UTC
-            return int(ts.hour), int(ts.minute), int(ts.dayofweek)
+            return int(ts.hour), int(ts.minute), int(ts.weekday())
         except Exception:
             return None
 
@@ -1226,11 +833,11 @@ class MarketEnv:
             ts = self.timestamps[idx]
             if ts.tzinfo is None:
                 h_utc = int(ts.hour)
-                dow = int(ts.dayofweek)
+                dow = int(ts.weekday())
             else:
                 ts_utc = ts.astimezone(timezone.utc) if ts.tzinfo != timezone.utc else ts
                 h_utc = int(ts_utc.hour)
-                dow = int(ts_utc.dayofweek)
+                dow = int(ts_utc.weekday())
             time_mult = self._spread_time_multiplier(h_utc, dow)
         except Exception:
             time_mult = 1.0
@@ -1553,22 +1160,16 @@ class MarketEnv:
         idx = min(self.current_step, len(self.df) - 1)
         start = idx - self.seq_len + 1
 
-        if start >= 0:
-            block = self.df.iloc[start : idx + 1][self.encoder_feature_cols].values.astype(
-                np.float32
-            )
-        else:
-            block = np.zeros((self.seq_len, len(self.encoder_feature_cols)), dtype=np.float32)
-            n_ex = idx + 1
-            if n_ex > 0:
-                block[-n_ex:] = self.df.iloc[0 : idx + 1][self.encoder_feature_cols].values.astype(
-                    np.float32
-                )
+        n_feat = 1 if self._enc_x is None else self._enc_x.shape[1]
+        if self._enc_x is None:
+            block = np.zeros((self.seq_len, n_feat), dtype=np.float32)
+        elif start >= 0:
+            block = self._enc_x[start : idx + 1]
+        else:  # first bars: zero padding on the left
+            block = np.zeros((self.seq_len, n_feat), dtype=np.float32)
+            block[-(idx + 1) :] = self._enc_x[: idx + 1]
 
-        # No padding needed: the missing features (asset_embed_dim=8)
-        # are added by the encoder itself through the asset_embedding lookup
-
-        x_input = torch.from_numpy(block).unsqueeze(0).to(self.device).float()
+        x_input = torch.from_numpy(np.ascontiguousarray(block)).unsqueeze(0).to(self.device)
 
         if self.encoder is not None:
             with torch.no_grad():
@@ -1736,16 +1337,6 @@ class MarketEnv:
         bkt[min(5, ts.hour // 4)] = 1
         dow = [1 if i == ts.weekday() else 0 for i in range(7)]
 
-        deltas = [
-            float(self.df.iloc[idx].get(n, 0.0)) if n in self.df.columns else 0.0
-            for n in [
-                "delta_EMA50_1D_15min",
-                "delta_EMA20_4H_15min",
-                "delta_RSI14_4H_15min",
-                "delta_CCI20_4H_15min",
-            ]
-        ]
-
         start_step = max(0, idx - self.historical_24h_bars)
         recent = sum(
             1 for t in getattr(self, "episode_trades", []) if (t.get("exit_idx") or 0) >= start_step
@@ -1775,8 +1366,7 @@ class MarketEnv:
 
         # NEW v2: spread normalized by the raw ATR -> relative cost of opening
         # the spread column is RAW-ONLY (not scaled) -> divided directly by the raw ATR
-        spread_col = self.cfg.get("spread_col", "spread_mean_15m_raw")
-        spread_raw = float(self.df.iloc[idx].get(spread_col, 0.0))
+        spread_raw = float(self.df.iloc[idx].get(self.spread_col, 0.0))
         spread_norm = float(np.clip(spread_raw / (atr_ref + 1e-9), 0.0, 1.0))
 
         if self.position is not None:
@@ -1987,15 +1577,16 @@ class MarketEnv:
         # dim 143-145:  brk_prob (3 TF: 1h,4h,30m)                    3  ← +1 vs v25
         # dim 146-165:  market features (vol, atr, spread, bkt, dow…) 20
         # dim 166-173:  position features                               8
-        # dim 174-181:  daily_dd, trades, rp, deltas                   8
-        # dim 182-185:  last_rr, last_win, vol_pred                    4
-        # dim 186-189:  portfolio context (joint)                       4
-        # dim 190-201:  v26 StrategyOutcomeHead features               12
+        # dim 174-177:  daily_dd_pct, trades_remaining, trades_norm, rp  4
+        # dim 178-181:  last_rr, last_win, vol_pred                    4
+        # dim 182-185:  portfolio context (joint)                       4
+        # dim 186-197:  v26 StrategyOutcomeHead features               12
         #   p_hit_tl, p_hit_ts, p_hit_ml, p_hit_ms  (P(hit) per combo)
         #   p_tp_tl, p_tp_ts, p_tp_ml, p_tp_ms      (P(TP) per combo)
         #   best_trend_tp, best_mr_tp, trend_vs_mr, dir_edge
-        # dim 202-203:  session validity (bars_to_fc_norm, is_near_fc) 2
-        # TOTAL: 204 dims
+        # dim 198-199:  session validity (bars_to_fc_norm, is_near_fc) 2
+        # TOTAL: 200 dims (gru_hidden + 72); the 4 cross-TF delta_* columns of v26
+        # were dropped: the data never had them (always 0)
         state = np.concatenate(
             [
                 z.astype(np.float32),  # 128
@@ -2015,7 +1606,6 @@ class MarketEnv:
                 np.array(bkt, dtype=np.float32),  #   6
                 np.array(dow, dtype=np.float32),  #   7
                 np.array([trades_norm, float(rp)], dtype=np.float32),  #   2
-                np.array(deltas, dtype=np.float32),  #   4
                 np.array([unrealized_pnl_norm], dtype=np.float32),  #   1
                 np.array([bars_norm], dtype=np.float32),  #   1
                 np.array([mfe_norm], dtype=np.float32),  #   1

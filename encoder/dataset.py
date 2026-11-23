@@ -244,6 +244,125 @@ def simulate_trade(
     return hit, np.int8(0), be_reach, loss_w
 
 
+def session_features(index: pd.DatetimeIndex) -> np.ndarray:
+    """
+    The 7 session features of close-labelled 15min bars, [n, 7] float32: hour sin/cos,
+    London / New York / overlap flags (on the bar OPEN time, the session it trades in),
+    weekday sin/cos of the FX trading day. Shared by the dataset and the trading agent.
+    """
+    n = len(index)
+    try:
+        idx = index
+        if not isinstance(idx, pd.DatetimeIndex):
+            raise ValueError("Index is not DatetimeIndex")
+        idx_utc = bar_open_utc(idx)  # the session a bar trades in = its open time
+        h = idx_utc.hour.values.astype(np.float32)
+        m = idx_utc.minute.values.astype(np.float32)
+        h_frac = h + m / 60.0
+        hour_sin = np.sin(2.0 * np.pi * h_frac / 24.0).astype(np.float32)
+        hour_cos = np.cos(2.0 * np.pi * h_frac / 24.0).astype(np.float32)
+        h_int = idx_utc.hour.values
+        session_london = ((h_int >= 7) & (h_int < 16)).astype(np.float32)
+        session_ny = ((h_int >= 13) & (h_int < 21)).astype(np.float32)
+        session_overlap = ((h_int >= 13) & (h_int < 16)).astype(np.float32)
+        # FX trading day, 0..4: Sunday evening counts as Monday (the calendar weekday
+        # made Sunday 6 -> same sin/cos as Tuesday with a 5-day period)
+        dow = fx_trading_weekday(idx_utc).astype(np.float32)
+        dow_sin = np.sin(2.0 * np.pi * dow / 5.0).astype(np.float32)
+        dow_cos = np.cos(2.0 * np.pi * dow / 5.0).astype(np.float32)
+    except Exception as e:
+        logger.warning("Session feature computation failed (%s). Using zeros.", e)
+        return np.zeros((n, len(_SESSION_FEATURE_NAMES)), dtype=np.float32)
+    return np.stack(
+        [hour_sin, hour_cos, session_london, session_ny, session_overlap, dow_sin, dow_cos],
+        axis=1,
+    )
+
+
+def structural_features(real_col, n: int, stats: Optional[dict] = None):
+    """v30 — 5 structural features computed on EVERY bar as a time series (they're
+    symmetric, they don't depend on the trade direction), on REAL prices: the 15min
+    *_raw columns and the inverse-transformed daily levels (high_1D / low_1D / ATR14_1D).
+
+    Feature order: [prebreak_range_atr, breakout_impulsivity,
+                     day_extension_atr, asian_cleanliness, range_compression]
+
+    Robust normalization (x - median) / IQR, clipped to [-5, 5]. The median/IQR come
+    from `stats` when given (the training window's, see the trainer) and are otherwise
+    computed on this data and returned, so the validation and live data are normalized
+    with the training statistics. real_col(name) gives the real (unscaled) values of a
+    column or None; returns (features [n, 5] float32, stats).
+    Default OFF; with the flag ON they are continuous encoder inputs.
+    """
+    NF = len(_STRUCTURAL_FEATURE_NAMES)
+    hi = real_col("high_15min")
+    lo = real_col("low_15min")
+    cl = real_col("close_15min")
+    op = real_col("open_15min")
+    if hi is None or lo is None or cl is None:
+        raise ValueError("structural features need the real 15min high/low/close")
+    if op is None:
+        op = cl
+    # reference ATR: real daily if available, otherwise 15min
+    atr = real_col("atr14_1d")
+    if atr is None:
+        atr = real_col("atr14_15min")
+    if atr is None:
+        raise ValueError("structural features need ATR14_1D or ATR14_15min")
+    atr = np.where((atr > 0) & np.isfinite(atr), atr, np.nan)
+    hi1d = real_col("high_1d")
+    lo1d = real_col("low_1d")
+
+    hi_s, lo_s = pd.Series(hi), pd.Series(lo)
+    out = np.full((n, NF), np.nan, dtype=np.float64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        # prebreak_range_atr: range of the last 8 CLOSED bars / ATR
+        PRE, WIDE = 8, 24
+        pre_hi = hi_s.rolling(PRE).max().shift(1).values
+        pre_lo = lo_s.rolling(PRE).min().shift(1).values
+        out[:, 0] = (pre_hi - pre_lo) / atr
+        # breakout_impulsivity: sum|body| / sum range of the last 3 bars
+        body_s = pd.Series(np.abs(cl - op)).rolling(3).sum().shift(1).values
+        rng_s = pd.Series(hi - lo).rolling(3).sum().shift(1).values
+        out[:, 1] = np.where(rng_s > 0, body_s / rng_s, np.nan)
+        # day_extension_atr: range of the last closed daily bar / ATR
+        if hi1d is not None and lo1d is not None:
+            out[:, 2] = (hi1d - lo1d) / atr
+        else:
+            DAY = 96  # fallback: range of the last 96 bars
+            out[:, 2] = (
+                hi_s.rolling(DAY).max().shift(1).values - lo_s.rolling(DAY).min().shift(1).values
+            ) / atr
+        # asian_cleanliness: net move / total move of close over the last 32 bars
+        ASIA = 32
+        net = np.abs(pd.Series(cl).diff(ASIA - 1).values)
+        tot = pd.Series(np.abs(np.diff(cl, prepend=np.nan))).rolling(ASIA - 1).sum().values
+        out[:, 3] = pd.Series(np.where(tot > 0, net / tot, np.nan)).shift(1).values
+        # range_compression: 8-bar range / 24-bar range
+        wide = hi_s.rolling(WIDE).max().shift(1).values - lo_s.rolling(WIDE).min().shift(1).values
+        out[:, 4] = np.where(wide > 0, (pre_hi - pre_lo) / wide, np.nan)
+
+    # Robust normalization with the given (training) statistics, or this data's.
+    # The parquet features are pre-scaled and the session ones bounded: raw ratios
+    # (prebreak / day_extension can be 3-5) would unbalance training.
+    if stats is None:
+        stats = {}
+        for j, name in enumerate(_STRUCTURAL_FEATURE_NAMES):
+            finite = out[:, j][np.isfinite(out[:, j])]
+            med, scale = 0.0, 1.0
+            if finite.size > 100:
+                med = float(np.median(finite))
+                q1, q3 = np.percentile(finite, [25.0, 75.0])
+                sd = float(np.std(finite))
+                scale = float(q3 - q1) if q3 - q1 > 1e-8 else (sd if sd > 1e-8 else 1.0)
+            stats[name] = (med, scale)
+    for j, name in enumerate(_STRUCTURAL_FEATURE_NAMES):
+        med, scale = stats[name]
+        out[:, j] = np.clip((out[:, j] - med) / scale, -5.0, 5.0)
+    # leftover NaN (rolling warm-up) -> 0 = "typical" value after centering
+    return np.where(np.isfinite(out), out, 0.0).astype(np.float32), stats
+
+
 def winsorize_series(a: np.ndarray, lower_pct=1.0, upper_pct=99.0) -> np.ndarray:
     if a is None:
         return a
@@ -579,6 +698,45 @@ def autodetect_feature_columns(df: pd.DataFrame, tf_list: list[str]) -> list[str
         add_unique(numeric_cols)
 
     return [c for c in cols if c in all_cols]
+
+
+def encoder_input_matrix(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    use_session_features: bool = True,
+    use_structural_features: bool = False,
+    structural_stats: Optional[dict] = None,
+    scaler_map: Optional[dict] = None,
+) -> np.ndarray:
+    """
+    Encoder input of every row of a scaled parquet, [n, n_features] float32, built as
+    MarketPretrainDataset builds it: the feature columns (lowercase names, in the given
+    order), the session features, the structural features. For the structural ones pass
+    the training-window `structural_stats` of the encoder and the asset's scalers
+    (all_scalers.pkl) for the daily levels without a *_raw copy.
+    """
+    d = df.copy()
+    d.columns = [str(c).lower() for c in d.columns]
+    missing = [c for c in feature_cols if c not in d.columns]
+    if missing:
+        raise KeyError(f"encoder input columns missing from the data: {missing[:5]}")
+    parts = [d[feature_cols].values.astype(np.float32)]
+    if use_session_features:
+        parts.append(session_features(d.index))
+    if use_structural_features:
+        smap = _normalize_scaler_map(scaler_map or {})
+
+        def real_col(name):
+            if f"{name}_raw" in d.columns:
+                return pd.to_numeric(d[f"{name}_raw"], errors="coerce").values.astype(np.float64)
+            if name not in d.columns or smap.get(name) is None:
+                return None
+            return _inverse_transform_if_possible(d, name, smap).astype(np.float64)
+
+        if structural_stats is None:
+            logger.warning("structural features normalized with this data's own statistics")
+        parts.append(structural_features(real_col, len(d), structural_stats)[0])
+    return np.concatenate(parts, axis=1)
 
 
 def discover_scaler_files_auto(base_dir: str, class_name: str) -> dict[str, str]:
@@ -1024,92 +1182,10 @@ class MarketPretrainDataset(Dataset):
         return _inverse_transform_if_possible(df, name, smap).astype(np.float64)
 
     def _compute_structural_features(self, df: pd.DataFrame) -> np.ndarray:
-        """v30 — 5 structural features computed on EVERY bar as a time series (they're
-        symmetric, they don't depend on the trade direction), on REAL prices: the 15min
-        *_raw columns and the inverse-transformed daily levels (high_1D / low_1D / ATR14_1D).
-
-        Feature order: [prebreak_range_atr, breakout_impulsivity,
-                         day_extension_atr, asian_cleanliness, range_compression]
-
-        Robust normalization (x - median) / IQR, clipped to [-5, 5]. The median/IQR come
-        from `structural_stats` when given (the training window's, see the trainer) and
-        are otherwise computed on this dataset and stored in self.structural_stats, so the
-        validation and live data are normalized with the training statistics.
-        Default OFF; with the flag ON they are continuous encoder inputs.
-        """
-        n = len(df)
-        NF = len(_STRUCTURAL_FEATURE_NAMES)
-        hi = self._real_col(df, "high_15min")
-        lo = self._real_col(df, "low_15min")
-        cl = self._real_col(df, "close_15min")
-        op = self._real_col(df, "open_15min")
-        if hi is None or lo is None or cl is None:
-            raise ValueError("structural features need the real 15min high/low/close")
-        if op is None:
-            op = cl
-        # reference ATR: real daily if available, otherwise 15min
-        atr = self._real_col(df, "atr14_1d")
-        if atr is None:
-            atr = self._real_col(df, "atr14_15min")
-        if atr is None:
-            raise ValueError("structural features need ATR14_1D or ATR14_15min")
-        atr = np.where((atr > 0) & np.isfinite(atr), atr, np.nan)
-        hi1d = self._real_col(df, "high_1d")
-        lo1d = self._real_col(df, "low_1d")
-
-        hi_s, lo_s = pd.Series(hi), pd.Series(lo)
-        out = np.full((n, NF), np.nan, dtype=np.float64)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            # prebreak_range_atr: range of the last 8 CLOSED bars / ATR
-            PRE, WIDE = 8, 24
-            pre_hi = hi_s.rolling(PRE).max().shift(1).values
-            pre_lo = lo_s.rolling(PRE).min().shift(1).values
-            out[:, 0] = (pre_hi - pre_lo) / atr
-            # breakout_impulsivity: sum|body| / sum range of the last 3 bars
-            body_s = pd.Series(np.abs(cl - op)).rolling(3).sum().shift(1).values
-            rng_s = pd.Series(hi - lo).rolling(3).sum().shift(1).values
-            out[:, 1] = np.where(rng_s > 0, body_s / rng_s, np.nan)
-            # day_extension_atr: range of the last closed daily bar / ATR
-            if hi1d is not None and lo1d is not None:
-                out[:, 2] = (hi1d - lo1d) / atr
-            else:
-                DAY = 96  # fallback: range of the last 96 bars
-                out[:, 2] = (
-                    hi_s.rolling(DAY).max().shift(1).values
-                    - lo_s.rolling(DAY).min().shift(1).values
-                ) / atr
-            # asian_cleanliness: net move / total move of close over the last 32 bars
-            ASIA = 32
-            net = np.abs(pd.Series(cl).diff(ASIA - 1).values)
-            tot = pd.Series(np.abs(np.diff(cl, prepend=np.nan))).rolling(ASIA - 1).sum().values
-            out[:, 3] = pd.Series(np.where(tot > 0, net / tot, np.nan)).shift(1).values
-            # range_compression: 8-bar range / 24-bar range
-            wide = (
-                hi_s.rolling(WIDE).max().shift(1).values - lo_s.rolling(WIDE).min().shift(1).values
-            )
-            out[:, 4] = np.where(wide > 0, (pre_hi - pre_lo) / wide, np.nan)
-
-        # Robust normalization with the given (training) statistics, or this data's.
-        # The parquet features are pre-scaled and the session ones bounded: raw ratios
-        # (prebreak / day_extension can be 3-5) would unbalance training.
-        stats = self._structural_stats
-        if stats is None:
-            stats = {}
-            for j, name in enumerate(_STRUCTURAL_FEATURE_NAMES):
-                finite = out[:, j][np.isfinite(out[:, j])]
-                med, scale = 0.0, 1.0
-                if finite.size > 100:
-                    med = float(np.median(finite))
-                    q1, q3 = np.percentile(finite, [25.0, 75.0])
-                    sd = float(np.std(finite))
-                    scale = float(q3 - q1) if q3 - q1 > 1e-8 else (sd if sd > 1e-8 else 1.0)
-                stats[name] = (med, scale)
-            self._structural_stats = stats
-        for j, name in enumerate(_STRUCTURAL_FEATURE_NAMES):
-            med, scale = stats[name]
-            out[:, j] = np.clip((out[:, j] - med) / scale, -5.0, 5.0)
-        # leftover NaN (rolling warm-up) -> 0 = "typical" value after centering
-        return np.where(np.isfinite(out), out, 0.0).astype(np.float32)
+        out, self._structural_stats = structural_features(
+            lambda name: self._real_col(df, name), len(df), self._structural_stats
+        )
+        return out
 
     @property
     def structural_stats(self) -> Optional[dict]:
@@ -1118,33 +1194,7 @@ class MarketPretrainDataset(Dataset):
         return self._structural_stats
 
     def _compute_session_features(self, df: pd.DataFrame) -> np.ndarray:
-        n = len(df)
-        try:
-            idx = df.index
-            if not isinstance(idx, pd.DatetimeIndex):
-                raise ValueError("Index is not DatetimeIndex")
-            idx_utc = bar_open_utc(idx)  # the session a bar trades in = its open time
-            h = idx_utc.hour.values.astype(np.float32)
-            m = idx_utc.minute.values.astype(np.float32)
-            h_frac = h + m / 60.0
-            hour_sin = np.sin(2.0 * np.pi * h_frac / 24.0).astype(np.float32)
-            hour_cos = np.cos(2.0 * np.pi * h_frac / 24.0).astype(np.float32)
-            h_int = idx_utc.hour.values
-            session_london = ((h_int >= 7) & (h_int < 16)).astype(np.float32)
-            session_ny = ((h_int >= 13) & (h_int < 21)).astype(np.float32)
-            session_overlap = ((h_int >= 13) & (h_int < 16)).astype(np.float32)
-            # FX trading day, 0..4: Sunday evening counts as Monday (the calendar weekday
-            # made Sunday 6 -> same sin/cos as Tuesday with a 5-day period)
-            dow = fx_trading_weekday(idx_utc).astype(np.float32)
-            dow_sin = np.sin(2.0 * np.pi * dow / 5.0).astype(np.float32)
-            dow_cos = np.cos(2.0 * np.pi * dow / 5.0).astype(np.float32)
-        except Exception as e:
-            logger.warning("Session feature computation failed (%s). Using zeros.", e)
-            return np.zeros((n, len(_SESSION_FEATURE_NAMES)), dtype=np.float32)
-        return np.stack(
-            [hour_sin, hour_cos, session_london, session_ny, session_overlap, dow_sin, dow_cos],
-            axis=1,
-        )
+        return session_features(df.index)
 
     def _ensure_loaded(self):
         if self._loaded:
