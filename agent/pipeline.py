@@ -2,13 +2,13 @@
 pipeline.py — walk-forward training / evaluation of the Rainbow DQN agent.
 
 Rainbow DQN (QR-DQN + Dueling + PER + N-step + Noisy) on top of the frozen market encoder:
- ✅ one encoder per WF ({wf_idx: checkpoint})
- ✅ off-policy RainbowAgent: store -> PER -> train_step every few steps
- ✅ per-asset N-step returns (sequences never mixed)
- ✅ curriculum (max_trades 2 -> 4 -> 5) and progressive DD schedules
- ✅ dense reward: mark-to-market + opportunity cost
- ✅ deterministic eval: NoisyLinear -> mean weights, no noise
- ✅ separate runs per class (Run1) or a joint Majors + Minors portfolio (Run2 / Run3)
+ one encoder per WF ({wf_idx: checkpoint})
+ off-policy RainbowAgent: store -> PER -> train_step every few steps
+ per-asset N-step returns (sequences never mixed)
+ curriculum (max_trades 2 -> 4 -> 5) and progressive DD schedules
+ dense reward: mark-to-market + opportunity cost
+ deterministic eval: NoisyLinear -> mean weights, no noise
+ separate runs per class (Run1) or a joint Majors + Minors portfolio (Run2 / Run3)
 
 Run: python -m agent.pipeline --help
 """
