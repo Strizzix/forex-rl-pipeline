@@ -11,7 +11,7 @@ select = ["E", "W", "F", "I", "B", "UP"]
 ignore = ["E501"]  # long lines are handled by black (only strings/comments can exceed)
 
 [tool.ruff.lint.isort]
-known-first-party = ["data_management", "encoder"]
+known-first-party = ["data_management", "encoder", "agent"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

@@ -1,7 +1,7 @@
 # forex-rl-pipeline
 
 End-to-end deep RL pipeline for forex: data download, preprocessing, multi-head
-encoder training and DDQN agent.
+encoder training and a Rainbow DQN trading agent.
 
 I'm building it one module at a time. So far:
 
@@ -11,13 +11,16 @@ I'm building it one module at a time. So far:
   holdout;
 - the **market encoder** (`encoder/`): a TCN-GRU network pretrained with several supervised
   heads and contrastive losses on those parquets, retrained walk-forward every six months.
-  Its embedding is the state the DDQN agent will work on.
+  Its embedding is the state the agent works on;
+- the **trading agent** (`agent/`): a Rainbow DQN that trades every asset of a class (or Majors
+  and Minors together) bar by bar on top of the frozen encoder, with an arbiter that ranks and
+  filters the proposals and a shared portfolio with drawdown limits, trained walk-forward.
 
 | Module | Status |
 |---|---|
 | `data_management/` — download, features, scaling | ✅ here |
 | `encoder/` — multi-head encoder, bootstrap + walk-forward retrain | ✅ here |
-| DDQN agent | coming next |
+| `agent/` — Rainbow DQN agent, arbiter, walk-forward runs | ✅ here (encoder alignment in progress, see below) |
 | live / paper trading | coming next |
 
 ---
@@ -166,6 +169,57 @@ baselines in the same folder.
 
 ---
 
+## Agent
+
+**Environment** (`agent/env.py`). `MarketEnv` walks one asset on the 15min scaled parquet. At
+every bar the frozen encoder embeds the last `seq_len` rows; the state is that embedding plus
+the head signals (trend momentum per TF, volatility regime / ATR / ADX / DI direction,
+breakout probability, the P(TP) of the four strategies from the `StrategyOutcomeHead`), a few
+market features, time features and the open position (unrealized PnL, MFE/MAE, distance to
+SL/TP, bars held): `gru_hidden + 76` values, 204 with the default encoder.
+Five actions: HOLD, LONG / SHORT trend (RR 1.8) and LONG / SHORT mean reversion (RR 1.0), SL
+and TP in ATR units checked on the real 15min prices, spread, slippage on gaps, commissions and
+swaps. Positions are closed on Wednesday (triple swap) and Friday evening. The reward is the
+trade result in R plus a dense shaping (mark-to-market, Sharpe bonus, drawdown penalty).
+
+**Agent** (`agent/rainbow.py`): Rainbow DQN — QR-DQN with 32 quantiles, Double DQN, dueling
+heads, noisy layers instead of epsilon, prioritized replay on a SumTree and N-step returns kept
+**per asset**, so sequences of different assets never mix. An elite buffer keeps the best
+ranked trades and samples them in every batch.
+
+**Arbiter and runner** (`agent/arbiter.py`). Every step `MultiAssetRunner` asks the agent for
+the Q-values of every asset, `TradeArbiter` turns them into proposals, scores them (Q-gap and
+encoder signals agreeing with the direction), applies the entry filters (DI direction,
+breakout probability, regime uncertainty, time to the forced close), and only the best ones,
+up to the concurrent-positions cap, are executed on a shared `Portfolio`. Daily loss limits,
+drawdown ladders and a kill switch (drawdown velocity, ATR spikes, PnL anomalies) stop the
+trading when needed.
+
+**Runs** (`agent/config.py`, `RUN_CONFIGS`):
+
+| Run | What | Output |
+|---|---|---|
+| `run1_majors` / `run1_minors` | one class at a time, light filters, exploration | `Exploration/<class>` |
+| `run2_joint` | Majors + Minors on one portfolio, starts from the two Run1 agents merged, filters at 40% | `Consolidation/Joint` |
+| `run3_joint` | joint, filters at 100% (train = eval) | `Production/Joint` |
+
+Every run is walk-forward (`wf_splits`): one encoder checkpoint per WF (Bootstrap, then the
+retrain of each WF), the agent of a WF starts from the one of the previous WF, each WF is
+evaluated out-of-sample on the next half-year. Per WF it saves the agent, a training log and
+`eval_summary_<wf>.json` / `val_summary_<wf>.json`:
+
+```
+<models>/Rainbow/runs/Exploration/<class>/<class>_<wf>/<class>_agent_<wf>.pth
+<models>/Rainbow/runs/Consolidation/Joint/Joint_<wf>/Joint_agent_<wf>.pth
+```
+
+> **Encoder alignment.** The environment reads the "v26" encoder checkpoint (trend, regime,
+> market-structure heads and a `StrategyOutcomeHead`). The encoder now in `encoder/` (session /
+> PDHL heads, bar-close data) saves different heads, so the two must be aligned before
+> training the agent on the new data — see the CHANGELOG.
+
+---
+
 ## Layout
 
 ```
@@ -182,7 +236,13 @@ encoder/
     dataset.py       input windows, session/structural features, all the labels
     components.py    TCN-GRU encoder, heads, augmentations, contrastive losses
     trainer.py       bootstrap / walk-forward retrain, metrics, checkpoints, CLI
-tests/               data, scaler and encoder tests on synthetic data (no download, CPU)
+agent/
+    config.py        DEFAULT_CFG (env, arbiter, runner, Rainbow), RUN_CONFIGS, build_cfg
+    env.py           MarketEnv: encoder state, SL/TP execution, costs, reward
+    rainbow.py       Rainbow DQN: QR-DQN, dueling, noisy layers, PER, per-asset N-step
+    arbiter.py       TradeArbiter, Portfolio, MultiAssetRunner (filters, risk, kill switch)
+    pipeline.py      walk-forward training / evaluation, joint runs, CLI
+tests/               data, scaler, encoder and agent tests on synthetic data (no download, CPU)
 ```
 
 Data (root set with `--root` or the `FX_DATA_ROOT` env var; encoder checkpoints under
@@ -241,6 +301,27 @@ python -m encoder.trainer --config my_run.json      # several overrides in a JSO
 
 The scaled data must come from the current `data_management` (bar-close labels): an encoder
 trained on the older open-labelled data should be bootstrapped again on the new data.
+
+### Training the agent
+
+```bash
+# Run1: one class at a time (encoders found in <models>/Encoder/<class>/Checkpoint)
+python -m agent.pipeline --run run1_majors --root D:/Data --models-root D:/Models
+python -m agent.pipeline --run run1_minors --root D:/Data --models-root D:/Models
+
+# Run2 / Run3: joint portfolio, starting from the last Run1 agent of each class
+python -m agent.pipeline --run run2_joint --root D:/Data --models-root D:/Models
+python -m agent.pipeline --run run2_joint --init-majors path/to/Majors_agent_WF5.pth --init-minors ...
+
+# evaluation only, other settings
+python -m agent.pipeline --run run3_joint --eval-only
+python -m agent.pipeline --run run1_majors --set device=cpu rainbow_cfg='{"lr": 1e-4}'
+python -m agent.pipeline --run run1_majors --config my_run.json
+```
+
+`--set` values are JSON (nested dicts are merged one level deep). `keepalive: true` presses
+Shift every few minutes during long runs on a remote desktop; it needs `pyautogui`, which is
+not in the requirements.
 
 ### Checking the data
 
@@ -302,6 +383,9 @@ Offline, on synthetic data:
 - encoder time convention: session features and weekday on the bar open time, 4H closes in
   summer time, TF closes matching the rows where a new bar appears, PDHL DI gate applied,
   inputs without bar-close labels refused
+- agent: Rainbow train step, per-asset N-step buffers, masked actions, save / load round trip;
+  entry filters; environment state size and steps with a v26-style encoder checkpoint; config
+  overrides and checkpoint discovery; one walk-forward WF through the CLI (train, save, eval)
 
 ---
 

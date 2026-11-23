@@ -16,6 +16,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the next `update`; scale them again with `--refit`. **(AI-assisted)**
 
 ### Added
+- `agent/`: the Rainbow DQN trading agent, moved in from the research scripts `env_fx.py`,
+  `agent_rainbow.py`, `arbiter.py`, `main_pipeline_ppo.py`: package layout, the configuration
+  (`DEFAULT_CFG`, `RUN_CONFIGS`) in `agent/config.py`, a CLI (`python -m agent.pipeline --run ...`)
+  that finds the encoder checkpoint of every WF and the Run1 agents for the joint runs instead of
+  the hard-coded paths, comments and logs in English, Black/Ruff clean. Same agent weights and
+  evaluation results as the scripts (checked bit for bit on synthetic data, single class and
+  joint run). **(AI-assisted)**
+- `tests/test_agent.py`: Rainbow train step and save/load, entry filters, environment state and
+  steps, config and checkpoint discovery, one WF through the CLI. **(AI-assisted)**
 - `encoder`: `outcome_session_sl_r` / `outcome_pdhl_sl_r` now set the SL (multiples of range/3);
   the default 1.0 gives the same labels as before. **(AI-assisted)**
 - `encoder`: the trainer refuses inputs without bar-close labels (older downloader) or raw /
@@ -72,6 +81,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   **(AI-assisted)**
 
 ### Fixed
+- `agent`: `TradeArbiter.passes_entry_filter` was called by the runner but no longer existed
+  (the scripts crashed at the first proposal); it is back, as `entry_filter_reason(...) == "pass"`.
+  **(AI-assisted)**
+- `agent`: `run_pipeline` copied `DEFAULT_CFG` shallowly, so the overrides of one run changed the
+  nested defaults of the next one in the same process; it now uses a deep copy. **(AI-assisted)**
+- `agent`: `pytz` replaced by `datetime.timezone` (it wasn't in the requirements);
+  `python-dateutil` added to them. **(AI-assisted)**
 - `checks`: `DatetimeIndex.dayofweek` (deprecated, removed in pandas 4) replaced with
   `day_of_week`; deprecation warnings raised by the package now fail the test suite. **(AI-assisted)**
 - `encoder`, time convention: sessions (Asian range 00-07 UTC, London, PDHL window), days and the
@@ -126,6 +142,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   labels and the backtest will no longer match.
 
 ### Suggested, not applied
+- **Agent vs encoder** — needed before training the agent on the new data: **(AI-assisted review)**
+  - the environment needs a `StrategyOutcomeHead` (`strategy_outcome_head_state`); the current
+    encoder saves session / PDHL / regime-quality heads instead, so 12 state features become
+    constants and the arbiter's P(TP) bonuses are lost;
+  - `env.py` rebuilds the heads from the `state_dict` with generic layers: the trend head loses
+    its `tanh * 3` and the regime head puts `softplus` on DI direction, which can no longer be
+    negative (DI gates and bonuses broken). The env should import the heads from
+    `encoder.components`;
+  - input columns: the env uses the parquet order and its own session features (on the row
+    timestamp); the encoder groups the columns by TF and computes sessions on the bar open
+    time. Both should call the same function from `encoder.dataset`;
+  - column names: `spread_col` is `spread_mean_15m_raw` but the data has
+    `spread_mean_15min_raw` (spread feature always 0); the `delta_*` columns don't exist;
+  - the agent and the encoder share `<models>/Encoder/<class>/Checkpoint`: an encoder for the
+    agent and the PDHL one need separate folders;
+  - the environments are created before the random seeds are set, so two runs with the same
+    seed differ; seed at the start of `run_pipeline`.
 - **License**: the repository has no `LICENSE` file; without one, nobody else may legally reuse the
   code. **(AI-assisted review)**
 - **Encoder, spread and costs**: the strategy labels use mid prices with no spread; a long stop
